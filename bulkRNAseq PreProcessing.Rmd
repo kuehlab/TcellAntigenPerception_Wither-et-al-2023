@@ -1,0 +1,134 @@
+---
+title: "Novogene RNAseq Pre-processing"
+author: "Matthew Wither"
+date: "3/1/23"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+Walk-throughs and resources for sleuth
+[link] https://pachterlab.github.io/sleuth_walkthroughs/trapnell/analysis.html
+[link] https://pachterlab.github.io/sleuth_walkthroughs/pval_agg/analysis.html
+[link] https://hbctraining.github.io/DGE_workshop_salmon/lessons/09_sleuth.html
+[link] https://pachterlab.github.io/sleuth_walkthroughs/boj/analysis.html
+
+
+Load packages and user-defined functions
+```{r}
+suppressMessages(library(sleuth))
+library(biomaRt)
+library(dplyr)
+library("org.Mm.eg.db", character.only = TRUE)
+
+```
+
+Load metadata and abundance files from kallisto
+```{r, eval = FALSE}
+main_dir <- "/Users/matthewjwither/R/rnaseq/Novogene"
+samp_file <- file.path(main_dir, "sampIDs.csv")
+folders <- dir(file.path(main_dir, "raw_data"))
+
+#Load in metadata and paths to kallisto abundance files
+s2c <- read.csv(samp_file, header = T)
+s2c$path <- file.path(main_dir, "raw_data", folders, "kallisto")
+s2c$condition <- factor(s2c$condition, levels = c("MEKi+CsA", "2pmol", "20pmol", "MEKi", "CsA")) #Set dual inhibitor as base level (i.e. control condition) to compare against (sleuth objects use the first level for this)
+
+#Retrieve gene names
+mart <- useMart(biomart = "ENSEMBL_MART_ENSEMBL",
+        dataset = "mmusculus_gene_ensembl",
+        host = 'ensembl.org')
+
+ensemble2gene <- getBM(attributes = c("ensembl_transcript_id", "ensembl_gene_id",
+                                      "external_gene_name"), mart = mart)
+ensemble2gene <- dplyr::rename(ensemble2gene, target_id = ensembl_transcript_id,
+       ens_gene = ensembl_gene_id, gene = external_gene_name)
+
+#Create sleuth object
+so <- sleuth_prep(s2c, target_mapping = ensemble2gene,
+                  aggregation_column = 'ens_gene', 
+                  extra_bootstrap_summary = TRUE,
+                  read_bootstrap_tpm = TRUE,
+                  gene_mode = TRUE,
+                  transformation_function = function(x) log2(x + 0.5))
+```
+
+Fit sleuth models for multiple conditions (i.e. > 2)
+```{r, eval=FALSE}
+so <- sleuth_fit(so, ~condition, 'full')
+so <- sleuth_fit(so, ~1, 'reduced')
+so <- sleuth_lrt(so, 'reduced', 'full')
+
+```
+
+PCA
+```{r}
+
+#Figure S3A
+plot_pca(so, color_by = 'condition', units = 'scaled_reads_per_base')
+
+```
+
+Save sleuth object
+```{r}
+
+#save sleuth object for quick loading in future analyses
+sleuth_save(so, "RNAseqInhibitorAssay")
+
+```
+
+Prepare heatmap data - Fig 3
+```{r}
+
+sleuth_table <- sleuth_results(so, 'reduced:full', 'lrt', show_all = FALSE)
+sleuth_significant <- subset(sleuth_table, qval <= 0.001)
+
+#First extract data from sleuth object and format for heatmap
+top_transcripts <- sleuth_significant$target_id
+
+heatdata <- so$obs_norm[so$obs_norm$target_id %in% top_transcripts, ]
+
+#Use tpm data
+heatdata <- dplyr::select(heatdata, target_id, sample, tpm)
+heatdata <- reshape2::dcast(heatdata, target_id ~sample, value.var = 'tpm')
+heatdata$gene <- sleuth_table$gene[match(heatdata$target_id, sleuth_table$target_id)]
+
+#Change gene IDs to recognizable names
+rownames(heatdata) <- heatdata$gene
+heatdata$gene <- NULL
+heatdata$target_id <- NULL
+
+#Remove 20pmol condition for now
+heatdata$A1 <- NULL
+heatdata$B1 <- NULL
+
+#Get condition names
+s2c <- so$sample_to_covariates
+s2c$condition <- as.character(s2c$condition)
+#Remove 20pmol
+s2c <- s2c[-c(1,6),]
+
+#Rename 2pmol condition to DMSO
+s2c$condition[which(s2c$condition == "2pmol")] <- "DMSO"
+
+trans <- 'log2'
+#Pulled from sleuth function for transforming the data
+offset <- 1
+if (nchar(trans) > 0 && !is.null(trans)) {
+    tFunc <- eval(parse(text = trans))
+    heatdata <- as.matrix(tFunc(heatdata + offset))
+  } else if (is.function(trans)){
+    heatdata <- as.matrix(trans(heatdata + offset))
+  } else {
+    heatdata <- as.matrix(heatdata)
+  }
+
+
+```
+
+Export heatmap data
+```{r}
+
+saveRDS(list(data = heatdata, s2c = s2c), "bulkRNAseq_heatmap_data.rds")
+
+```

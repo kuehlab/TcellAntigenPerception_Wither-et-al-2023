@@ -1,0 +1,267 @@
+---
+title: "10x scRNAseq Analysis"
+author: "Matthew Wither"
+date: "3/1/223"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+Walk-throughs and resources for Moncole3 used for this analysis
+[link] https://cole-trapnell-lab.github.io/monocle3/docs/starting/
+[link] https://davetang.org/muse/2017/10/01/getting-started-monocle/
+[link] https://cole-trapnell-lab.github.io/monocle-release/docs/#filtering-low-quality-cells-recommended
+
+Load packages and user-defined functions
+```{r, eval = FALSE}
+suppressMessages(library(sleuth))
+library(RColorBrewer)
+library(VennDiagram)
+library(dplyr)
+library(ggrepel)
+suppressPackageStartupMessages(library(ComplexHeatmap))
+library(clusterProfiler)
+library(enrichplot)
+library(ggplot2)
+library(gridExtra)
+library(msigdbr)
+library(ggforce)
+library(patchwork)
+library(monocle3)
+
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+
+theme_set(theme_bw())
+
+scatter_colors <-c("02pmolA" = "plum1", "2pmolA" = "mediumorchid2", "20pmolA" = "darkorchid3", "20pmolPA" = "#E38E14", "80pmolPA" = "#A17339", "Rest" = "grey60")
+
+```
+
+Load data
+```{r Load data}
+main_dir <- "/Users/matthewjwither/Desktop/analysis_objects/"
+rdsfile <- "cds_matt_072722.rds"
+
+conditions_10x <- c("Rest", "20pmolA", "2pmolA", "02pmolA", "80pmolPA", "20pmolPA")
+
+#Load in cds
+cds <- readRDS(paste0(main_dir, rdsfile))
+
+cds <- detect_genes(cds, min_expr = 0.1)
+
+# add a UMI column into pData
+pData(cds)$UMI <- Matrix::colSums(exprs(cds))
+
+
+```
+
+Processing and QC
+```{r QC}
+#Get expression of mitochondrial genes per cell
+mito_genes <- startsWith(rowData(cds)$gene_short_name, 'mt-')
+cds_mito <- cds[mito_genes,]
+
+#Add mitochondrial UMIs to pData
+pData(cds)$UMI_mito <- Matrix::colSums(exprs(cds_mito))
+
+# Add column for percent mitochondrial reads
+pData(cds)$frac_mito <- pData(cds)$UMI_mito / pData(cds)$UMI
+
+#Call doublets and de-multiplex
+pData2 <- as.data.frame(pData(cds))
+pData2$Cond <- NA
+pData2$counts_frac <- NA
+pData2$counts_correct <- pmax(pData2$Sample1.TotalSeqB, pData2$Sample2.TotalSeqB,
+                              pData2$Sample3.TotalSeqB, pData2$Sample4.TotalSeqB,
+                              pData2$Sample5.TotalSeqB, pData2$Sample6.TotalSeqB)
+
+#Call conditions based on TotalSeqB antibody reads
+for (i in 1:length(pData2$barcode)) {
+  temp <- pData2[i,c(3:8)]
+  total <- rowSums(temp)[[1]]
+  max <- pData2$counts_correct[i]
+  pData2$counts_frac[i] <- max/total
+  HTO <- names(which(t(temp)[,1] == max))
+  HTO <- sub(".TotalSeqB", "", HTO)
+  HTO <- sub("Sample", "", HTO)
+  if (length(HTO) == 1) {
+    pData2$Cond[i] <- conditions_10x[as.numeric(HTO)]
+  }
+}
+rm(temp)
+
+pData2$Cond <- factor(pData2$Cond, levels = conditions_10x)
+
+#Assign condition to each cell
+pData(cds)$Cond <- pData2$Cond
+
+#Plot UMI vs # genes expressed per cell
+ggplot(pData2, aes(x = num_genes_expressed, y = UMI)) + 
+  geom_point()
+
+#plot HTO counts vs fraction of total
+ggplot(pData2, aes( x= counts_correct, y = counts_frac)) + 
+  geom_point()
+
+#Visualize fraction of mitochondrial reads by condition
+ggplot(pData2, aes(x = Cond, y = frac_mito, color = Cond)) + 
+  geom_boxplot(show.legend = F) + 
+  geom_hline(aes(yintercept = 0.075)) +
+  scale_color_manual(values = scatter_colors) + 
+  labs(title = "Fraction Mitochondrial reads")
+
+```
+
+Filter cells
+```{r Filter cells}
+#Filter cells
+valid_cells <- row.names(subset(pData2, 
+                                counts_frac > 0.7 & #doublets
+                                frac_mito < 0.075 & #high mitochondrial reads
+                                !is.na(Cond)))
+
+#doublets <- row.names(subset(pData2, counts_frac <= 0.7))
+
+cds2 <- cds[,valid_cells]
+
+#cds2 <- reduce_dimension(cds2, reduction_method = 'UMAP')
+pData2 <- as.data.frame(pData(cds2))
+
+
+
+
+```
+
+Add pMHC information
+```{r Add Dose and Affinity variables}
+#group cells based on affinity and dose
+pData2$Affinity <- NA
+pData2$Dose <- NA
+
+pData2$Affinity[which(pData2$Cond %in% conditions_10x[2:4])] <- 1
+pData2$Affinity[which(pData2$Cond %in% conditions_10x[5:6])] <- 2
+
+pData2$Dose[which(pData2$Cond == conditions_10x[2])] <- 20
+pData2$Dose[which(pData2$Cond == conditions_10x[3])] <- 2
+pData2$Dose[which(pData2$Cond == conditions_10x[4])] <- 0.2
+pData2$Dose[which(pData2$Cond == conditions_10x[5])] <- 80
+pData2$Dose[which(pData2$Cond == conditions_10x[6])] <- 20
+
+pData2$Dose <- log10(pData2$Dose/2)
+
+#Add to cds2
+pData(cds2)$Affinity <- as.factor(pData2$Affinity)
+colData(cds2)$Dose <- pData2$Dose
+
+pData2 <- as.data.frame(pData(cds2))
+
+```
+
+Save processed cds
+```{r Save cds object}
+
+#This does not filter on Erk and NFAT regulated genes identified from bulk RNA seq inhibitor assay.
+saveRDS(cds2, paste0(main_dir, "cds_full.rds"))
+
+
+```
+
+Visualizations
+``` {r QC Visualizations}
+
+#UMIs per cell
+ggplot(data = pData2, aes(x = Cond, y = UMI, color = Cond)) +
+  geom_boxplot(show.legend = F) +
+  scale_color_manual(values = scatter_colors) +
+  labs(title = "UMIs per cell")
+
+#genes expressed per cell
+ggplot(data = pData2, aes(x = Cond, y = num_genes_expressed, color = Cond)) +
+  geom_boxplot(show.legend = F) +
+  scale_color_manual(values = scatter_colors) +
+  labs(title = "# genes expressed per cell)")
+
+```
+
+Subset cds on NFAT/Erk target genes identified from bulk RNA seq data
+```{r}
+
+sleuthdata <- readRDS(paste0(main_dir, "bulkRNAseq_heatmap_data.rds"))
+heatdata <- sleuthdata[["data"]]
+
+gene_list <- row.names(subset(fData(cds2), gene_short_name %in% rownames(heatdata)))
+
+cds_gene_subset <- cds2[gene_list,]
+
+#Filter cells by UMI threshold
+UMI_threshold <- 500
+
+pData1 <- as.data.frame(pData(cds_gene_subset))
+
+#UMIs per cell
+ggplot(data = pData1, aes(x = Cond, y = UMI, color = Cond)) +
+  geom_boxplot(show.legend = F) +
+  scale_color_manual(values = scatter_colors) +
+  labs(title = "UMIs per cell")
+
+median(pData1$UMI)
+
+
+good_cells <- row.names(subset(pData1, UMI >= UMI_threshold))
+expressed_genes <- row.names(subset(fData(cds_gene_subset), num_cells_expressed >= 100))
+
+cds3 <- cds_gene_subset[expressed_genes,good_cells]
+
+
+#These parameters work well with 500 UMI cutoff.
+set.seed(10)
+cds3 <- preprocess_cds(cds3, num_dim = 100)
+cds3 <- reduce_dimension(cds3, reduction_method = "UMAP", umap.min_dist = 0.05, umap.n_neighbors = 6)
+
+pData1 <- as.data.frame(pData(cds3))
+
+
+```
+
+Cluster cells
+```{r}
+#Define clusters automatically - Louvain/Leiden community detection
+cds3 <- cluster_cells(cds3, reduction_method = "UMAP", k = 8)
+
+colData(cds3)$cluster <- clusters(cds3)
+
+rData1 <- as.data.frame(rowData(cds3))
+pData1 <- as.data.frame(colData(cds3))
+
+plot_cells(cds3, label_cell_groups = T,group_label_size = 8) + scale_color_manual(values = gg_color_hue(13))
+
+#Remove outlier clusters
+good_clusters <- row.names(subset(pData1, as.numeric(cluster) < 9))
+cds3 <- cds3[,good_clusters]
+
+#Re-assign cluster numbers to follow inferred trajectory
+pData1 <- as.data.frame(pData(cds3))
+pData1$new_clust <- NA
+pData1$new_clust[which(pData1$cluster == 1)] <- 1
+pData1$new_clust[which(pData1$cluster == 2)] <- 2
+pData1$new_clust[which(pData1$cluster == 4)] <- 3
+pData1$new_clust[which(pData1$cluster == 6)] <- 4
+pData1$new_clust[which(pData1$cluster == 7)] <- 5
+pData1$new_clust[which(pData1$cluster == 5)] <- 6
+pData1$new_clust[which(pData1$cluster == 3)] <- 7
+pData1$new_clust[which(pData1$cluster == 8)] <- 8
+
+colData(cds3)$new_cluster <- factor(pData1$new_clust)
+
+```
+
+Save FINAL cds
+```{r}
+
+#saveRDS(cds3, "cds3.rds")
+
+```
+

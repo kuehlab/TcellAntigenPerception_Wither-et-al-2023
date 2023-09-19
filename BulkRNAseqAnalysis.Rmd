@@ -1,0 +1,1155 @@
+---
+title: "Bulk RNAseq analysis"
+author: "Matthew Wither"
+date: "5/9/23"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+----------------------------------------------------------------
+
+Load packages and functions
+```{r}
+
+library(RColorBrewer)
+library(dplyr)
+library(ggrepel)
+suppressPackageStartupMessages(library(ComplexHeatmap))
+library(InteractiveComplexHeatmap)
+library(clusterProfiler)
+library(enrichplot)
+library(ggplot2)
+library(gridExtra)
+library(msigdbr)
+library(ggforce)
+library(patchwork)
+library(monocle3)
+library(ggpubr)
+library(stringi)
+library(viridis)
+library(caret)
+library(tidyr)
+library(circlize)
+library(ggridges)
+library(plotly)
+library(glmnet)
+library(pbmcapply)
+library(ClassDiscovery)
+library(dendextend)
+library(ggdensity)
+library(DescTools)
+library(VennDiagram)
+
+
+get_covariance_bootstrap_pval <- function(df, metric, scale_metrics = TRUE, iterations = 10000) {
+  
+  top_genes <- rownames(df)
+  
+  #Get number of genes per cluster for standard sampling
+  genes_per_cluster <- subset(df, !is.na(lasso_clust)) %>% dplyr::count(lasso_clust, sort = F)
+  
+  #covariance + means
+  cov_raw <- data.frame(lasso_clust = 1:8)
+  
+  all_metrics <- c("mNFAT", "mErk", "mErkNFAT", "mNEratio", "covNvE", "covNvEN", "covEvEN", "corNvE", "corNvEN", "corEvEN")
+  
+  # assertthat::assert_that(metric %in% all_metrics, 
+  #                         msg = paste0("Specified metric msut be one of ", all_metrics))
+  
+  
+  for (i in 1:8) {
+    
+    #Mean betas
+    temp_means <- colMeans(subset(df, lasso_clust == i)[,c(1:3,5)])
+    
+    #Covariances
+    temp_cov <- cov(subset(df, lasso_clust == i)[,1:3])
+    temp_cov <- temp_cov[lower.tri(temp_cov)]
+    
+    #Pearson correlation (i.e covariance normalized by variance)
+    temp_correlation <- cor(subset(df, lasso_clust == i)[,1:3])
+    temp_correlation <- temp_correlation[lower.tri(temp_correlation)]
+    
+    cov_raw[i,all_metrics] <- c(temp_means, temp_cov, temp_correlation)
+  }
+  
+  cov_raw$lasso_clust <- NULL
+  
+  #scale if needed
+  cov_scaled <- scale(cov_raw, center = scale_metrics, scale = scale_metrics)
+  
+  
+  #Initialize covariance distance matrices for true and shuffled values
+  true_dist_matrix <- matrix(data = NA, nrow = 8, ncol = 8)
+  colnames(true_dist_matrix) <- rownames(true_dist_matrix) <- 1:8
+  
+  for (i in 1:8) {
+    for (j in 1:8) {
+      true_cov <- list()
+      true_cov[[1]] <- cov_scaled[i,metric]
+      true_cov[[2]] <- cov_scaled[j,metric]
+      true_dist_matrix[i,j] <- cov_distance(true_cov)
+    }
+  }
+  
+
+  #Now Compute covariance random clusters to generate background distances
+  
+  shuffle_dist_matrix <- array(numeric(),c(8,8,iterations)) 
+  
+  #Bootstrap 10k iterations
+  pb <- progressBar(min = 0, max = iterations, initial = 0, style = "ETA")
+  for (b in 1:iterations) {
+    
+    #covariance + means
+    cov_raw_shuffled <- data.frame(lasso_clust = 1:8)
+    
+    for (c in 1:8) {
+      
+      #randomly sample genes
+      sample_c <- sample(rownames(df), size = genes_per_cluster$n[c], replace = T)
+      
+      temp_means <- colMeans(df[sample_c,c(1:3,5)])
+      
+      temp_cov <- cov(df[sample_c,1:3])
+      temp_cov <- temp_cov[lower.tri(temp_cov)]
+      
+      temp_correlation <- cor(df[sample_c,1:3])
+      temp_correlation <- temp_correlation[lower.tri(temp_correlation)]
+      
+      cov_raw_shuffled[c,all_metrics] <- c(temp_means, temp_cov, temp_correlation)
+      
+    }
+    
+    cov_raw_shuffled$lasso_clust <- NULL
+    
+    #scale if needed
+    cov_scaled_shuffled <- scale(cov_raw_shuffled, center = scale_metrics, scale = scale_metrics)
+    
+    
+    for (i in 1:8) {
+      for (j in 1:8) {
+        shuffled_cov <- list()
+        shuffled_cov[[1]] <- cov_scaled_shuffled[i,metric]
+        shuffled_cov[[2]] <- cov_scaled_shuffled[j,metric]
+        shuffle_dist_matrix[i,j,b] <- cov_distance(shuffled_cov)
+      }
+    }
+    
+    setTxtProgressBar(pb,b)
+  }
+  close(pb)
+  
+  #Get p values for covariance similarity
+  out_pval_matrix <- true_dist_matrix
+  for (i in 1:8) {
+    for (j in 1:8) {
+      out_pval_matrix[i,j] <- 1-ecdf(shuffle_dist_matrix[i,j,])(true_dist_matrix[i,j])
+    }
+  }
+  
+  out_pval_matrix
+  
+}
+
+get_summary_stats_random_distributions <- function(df, summary_df, iterations = 10000) {
+  
+  #Get number of genes per cluster for standard sampling
+  genes_per_cluster <- subset(df, !is.na(lasso_clust)) %>% dplyr::count(lasso_clust, sort = F)
+  
+  all_metrics <- colnames(summary_df)
+  
+  #Now compute background distributions
+  
+  random_distributions <- array(numeric(),c(8,length(all_metrics),iterations)) 
+  
+  #Bootstrap 10k iterations
+  pb <- progressBar(min = 0, max = iterations, initial = 0, style = "ETA")
+  for (b in 1:iterations) {
+    
+    #covariance + means
+    cov_raw_shuffled <- data.frame(lasso_clust = 1:8)
+    
+    for (c in 1:8) {
+      
+      #randomly sample genes
+      sample_c <- sample(rownames(df), size = genes_per_cluster$n[c], replace = T)
+      
+      #Mean betas
+      temp_means <- colMeans(df[sample_c,c(1:3)])
+      
+      #Cov and Var
+      temp_cov <- cov(df[sample_c,1:3])
+      temp_var <- diag(temp_cov)
+      
+      temp_cov <- temp_cov[lower.tri(temp_cov)]
+      
+      temp_correlation <- cor(df[sample_c,1:3])
+      temp_correlation <- temp_correlation[lower.tri(temp_correlation)]
+      
+      cov_raw_shuffled[c,all_metrics] <- c(temp_means, temp_var, temp_cov, temp_correlation)
+      
+    }
+    
+    cov_raw_shuffled$lasso_clust <- NULL
+    
+    random_distributions[,,b] <- scale(cov_raw_shuffled, center = FALSE, scale = FALSE)
+    
+    
+    setTxtProgressBar(pb,b)
+  }
+  close(pb)
+  
+  random_distributions
+  
+}
+
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+
+#Gene link LASSO Regreession functions (KA/Jun)
+do_lasso <- function(gene_matrix, gene_vector, seed = 1) {
+  
+  M1 = gene_matrix
+  y = gene_vector
+  
+  set.seed(seed)
+  cv.out1 = cv.glmnet(M1, y, alpha=1, lambda=exp(seq(log(0.001), log(10), length.out=100)))
+  r2_1 = r2_glmnet(cv.out1, y)
+  
+  bestlam = cv.out1$lambda.1se
+  cor_list = coef(cv.out1, s= bestlam)
+  cor_length = length(cor_list)
+  df_cor = data.frame("id" = row.names(cor_list)[2:cor_length], "corcoef" = cor_list[2:cor_length])
+  return(list(r2_1, df_cor))
+}
+
+r2_glmnet <- function(cv.out, y) {
+  bestlam = cv.out$lambda.1se
+  i = which(cv.out$lambda == bestlam)
+  e <- cv.out$cvm[i]
+  r2 <- 1 - e / var(y)
+  if(r2 < 0)
+  {
+    r2 = 0
+  }
+  return(r2)
+}
+
+#Function to pick top effect from pairwise comparisons
+pick_greater_effect <- function(x) {
+  x2 <- abs(x)
+  greater <- max(x2)
+  index <- match(greater, x2)
+  return(x[index])
+}
+
+#Scale data between 0 and 1
+range01 <- function(x){(x-min(x))/(max(x)-min(x))}
+
+theme_set(theme_bw())
+
+```
+
+
+Get inhibitor data for fitting
+Load bulk RNAseq results from sleuth
+```{r}
+
+setwd("/Users/matthewjwither/Desktop/analysis_objects")
+
+sleuthdata <- readRDS("bulkRNAseq_heatmap_data.rds")
+heatdata <- sleuthdata[["data"]]
+s2c <- sleuthdata[["s2c"]]
+
+```
+
+Load scRNAseq cds for gene filtering
+```{r}
+
+cds3 <- readRDS("cds3.rds")
+pData1 <- as.data.frame(pData(cds3))
+
+sc_data <- aggregate_gene_expression(cds3, cell_group_df = pData1[,c("barcode", "Cond")], norm_method = "log")
+
+#Swap target id for gene short name
+id2g <- as.data.frame(rowData(cds3))
+old_row_names <- rownames(sc_data)
+new_row_names <- match(old_row_names, id2g$id)
+rownames(sc_data) <- id2g$gene_short_name[new_row_names]
+
+#Re-order columns
+sc_data <- sc_data[,c("Rest", "20pmolPA", "80pmolPA", "02pmolA", "2pmolA", "20pmolA")]
+
+
+```
+
+Fig 3 - Heatmaps
+```{r}
+
+#Filter bulk RNAseq DEGs on those expressed in the 10X dataset
+heatdata <- heatdata[rownames(sc_data),]
+
+#Save uncentered heatdata as separate matrix
+heatdata2 <- heatdata
+
+#Center values, but do not scale
+heatdata <- t(scale(t(heatdata), scale = F, center = T))
+
+#reorder columns
+heatdata <- heatdata[,c("A5", "B5", "A4", "B4", "A3", "B3", "A2", "B2")]
+
+#Set condition ID colors for column header
+s2c_ha <- HeatmapAnnotation(Condition = factor(s2c$condition[match(colnames(heatdata), s2c$sample)], levels = rev(c("DMSO", "MEKi", "CsA", "MEKi+CsA"))),
+                              col = list(Condition = c("DMSO" = "#C77CFF",
+                                                  "MEKi" = "#F8766D",
+                                                  "CsA" = "#00BFC4",
+                                                  "MEKi+CsA" = "gray")),
+                            simple_anno_size = unit(2, "mm"),
+                            show_annotation_name = FALSE, show_legend = F)
+
+#Label GOIs
+GOIs2 <- c("Fosb", "Fos", "Cxcr6", "Bcl2a1d")
+GOIs2 <- c(GOIs2, "Tnf", "Prf1", "Egr1", "Egr2", "Egr3")
+GOIs2 <- c(GOIs2, "Ccl3", "Tnfrsf4", "Pdcd1", "Ccl4", "Btk")
+GOIs2 <- c(GOIs2, "Ifng", "Nr4a3", "Tead1", "Plek")
+GOIs2 <- c(GOIs2, "Il7r", "Runx2", "Il18r1", "Cd55")
+GOIs2 <- c(GOIs2, "Klf2", "Rasa3", "Ifngr2", "Ctla2b", "Gzma")
+GOIs2 <- c(GOIs2, "Gata3", "Cxcl10", "Klrd1", "Trim5")
+GOIs2 <- c(GOIs2, "Rel", "Serpinb9", "Serpinb6b")
+GOIs2 <- c(GOIs2, "Irf8", "Irf4", "Il2ra")
+GOIs2 <- c(GOIs2, "Lag3", "Tbx21")
+GOIs2 <- c(GOIs2, "Nr4a1")
+GOIs2 <- c(GOIs2, "Ccr7", "Eomes")
+GOIs2 <- c(GOIs2, "Stat1", "Tcf7")
+GOIs2 <- c(GOIs2, "Sell", "Ifngr1", "Gzmb")
+GOIs <- GOIs2
+rm(GOIs2)
+
+#Split heatdata into two groups based on max effect size
+m <- data.frame(Dual = rep(NA, length(rownames(heatdata2))))
+m$Dual <- rowMeans(heatdata2[,c('A5', 'B5')], na.rm=TRUE)
+m$CsA <- rowMeans(heatdata2[,c('A4', 'B4')], na.rm=TRUE)
+m$MEKi <- rowMeans(heatdata2[,c('A3', 'B3')], na.rm=TRUE)
+m$DMSO <- rowMeans(heatdata2[,c('A2', 'B2')], na.rm=TRUE)
+
+M <- m
+M$Dual <- m$Dual/m$DMSO
+M$CsA <- m$CsA/m$DMSO
+M$MEKi <- m$MEKi/m$DMSO
+M$DMSO <- m$DMSO/m$DMSO
+
+rownames(M) <- rownames(heatdata2)
+M2 <- as.matrix(M[,1:3]) %>% log2() %>% round(4) %>% as.data.frame()
+
+M2$best <- apply(M2, 1, pick_greater_effect)
+M2$abs_best <- abs(M2$best)
+
+#Fig 3C
+ggplot(M2, aes(x=abs_best)) + 
+  geom_density() +
+  geom_vline(aes(xintercept = log2(1.8)), color = "red") +
+  xlab("max abs(log2 FC)") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.text.y = element_text(size = 18), axis.title = element_text(size = 18, face = "bold"),
+        axis.text.x = element_text(size = 18))
+
+
+M2$group <- 1
+M2[M2$abs_best > log2(1.8), "group"] <- 2
+large_effect <- rownames(M2)[which(M2$group == 2)]
+small_effect <- rownames(M2)[which(M2$group == 1)]
+
+
+#Split into 2 groups, cluster, and plot
+heat1 <- heatdata[small_effect,]
+heat2 <- heatdata[large_effect,]
+
+d1 <- distanceMatrix(t(heat1), metric = "spearman")
+d1 <- hclust(d1)
+set.seed(12)
+d1 <- reorder(as.dendrogram(d1), heat1[,"A5"])
+
+d2 <- distanceMatrix(t(heat2), metric = "spearman")
+d2 <- hclust(d2)
+set.seed(12)
+d2 <- reorder(as.dendrogram(d2), heat2[,"A5"])
+
+
+genes_to_label_pos1 <- which(rownames(heat1) %in% GOIs)
+genes_to_label1 <- rownames(heat1[genes_to_label_pos1, ])
+left_row_ha1 = rowAnnotation(a = anno_mark(at= genes_to_label_pos1, labels = genes_to_label1, which="row", side = "left", labels_gp = gpar(col= "black", fontsize = 8)))
+
+genes_to_label_pos2 <- which(rownames(heat2) %in% GOIs)
+genes_to_label2 <- rownames(heat2[genes_to_label_pos2, ])
+left_row_ha2 = rowAnnotation(a = anno_mark(at= genes_to_label_pos2, labels = genes_to_label2, which="row", side = "left", labels_gp = gpar(col= "black", fontsize = 8)))
+
+col_heatdata = colorRamp2(c(-2, 0, 2), c(brewer.pal(7, "BrBG")[7], "white", brewer.pal(7, "BrBG")[1]))
+
+
+ht1 <- Heatmap(heat1,
+        col = col_heatdata,
+        cluster_rows = d1,
+        #row_split = 5,
+        #cluster_row_slices = T,
+        show_row_dend = F,
+        show_column_dend = FALSE,
+        show_column_names = FALSE,
+        show_row_names = FALSE,
+        cluster_columns = F,
+        top_annotation = s2c_ha,
+        left_annotation = left_row_ha1,
+        row_title = NULL,
+        row_gap = unit(2, "mm"),
+        border = TRUE,
+        border_gp = gpar(col = "black"))
+
+
+ht2 <- Heatmap(heat2,
+        col = col_heatdata,
+        cluster_rows = d2,
+        #row_split = 6,
+        #cluster_row_slices = T,
+        show_row_dend = F,
+        show_column_dend = FALSE,
+        show_column_names = FALSE,
+        show_row_names = FALSE,
+        cluster_columns = F,
+        top_annotation = s2c_ha,
+        left_annotation = left_row_ha2,
+        row_title = NULL,
+        row_gap = unit(2, "mm"),
+        border = TRUE,
+        border_gp = gpar(col = "black"))
+
+
+
+# pdf(file = "heat1+2.pdf", width = 3, height = 8)
+# draw(ht2 %v% ht1)
+# dev.off()
+# 
+# pdf(file = "heat1.pdf", width = 3, height = 4)
+# draw(ht1)
+# dev.off()
+# 
+# pdf(file = "heat2.pdf", width = 3, height = 4)
+# draw(ht2)
+# dev.off()
+
+
+```
+
+Fig 3D
+```{r Extract gene subsets for heat2}
+
+#htShiny(ht2)
+
+last_genes_in_cluster <- c("Pdcd1lg2", "Fosb", "Jazf1", "D630039A03Rik", "Ahnak", "Crybg1")
+
+cluster_borders <- data.frame("edge_gene" = last_genes_in_cluster, "dend_ind" = NA, "hm_ind" = NA, "cluster" = 1:length(last_genes_in_cluster))
+
+#Find the row index of the ordered heatmap that corresponds to the genes at the cluster edges
+for (i in 1:length(last_genes_in_cluster)) {
+  gene_i <- last_genes_in_cluster[i]
+  dend_index <- match(gene_i, labels(d2))
+  hm_index <- match(gene_i, rownames(heat2))
+  
+  cluster_borders$dend_ind[i] <- dend_index
+  cluster_borders$hm_ind[i] <- hm_index
+  
+}
+
+
+#Create data frame to store cluster IDs for each row
+row_split <- data.frame("gene" = rownames(heat2), "cluster" = NA)
+
+no_clusters <- length(last_genes_in_cluster)+1
+
+#Now assign each gene in the heatmap with its cluster ID
+for (i in 1:no_clusters) {
+  
+  #Get start and end indices for each cluster
+  if (i == 1) {
+    start <- 1
+    end <- cluster_borders$dend_ind[i]
+  } else if (i > 1 & i < no_clusters) {
+    start <- cluster_borders$dend_ind[i-1] + 1
+    end <- cluster_borders$dend_ind[i]
+  } else {
+    start <- cluster_borders$dend_ind[i-1] + 1
+    end <- length(labels(d2))
+  }
+  
+  #Which genes correspond to these indices?
+  cluster_i_genes <- labels(d2)[start:end]
+  
+  #Assign these genes as cluster i
+  row_split$cluster[which(row_split$gene %in% cluster_i_genes)] <- i
+
+}
+#Save as data frame to pass to heatmap
+split2 <- data.frame(row_split$cluster)
+rownames(split2) <- rownames(heat2)
+split2$row_split.cluster <- factor(split2$row_split.cluster, levels = c(2,1,3,4,6,7,5))
+
+
+#Fig 3D
+ht2 <- Heatmap(heat2,
+               col = col_heatdata,
+               clustering_distance_rows = "spearman",
+               cluster_rows = T,
+               row_split = split2,
+               cluster_row_slices = F,
+               show_row_dend = F,
+               show_column_dend = FALSE,
+               show_column_names = FALSE,
+               show_row_names = FALSE,
+               cluster_columns = F,
+               top_annotation = s2c_ha,
+               left_annotation = left_row_ha2,
+               row_title = NULL,
+               row_gap = unit(2, "mm"),
+               border = TRUE,
+               border_gp = gpar(col = "black"),
+               name = "log2 Exprs")
+
+draw(ht2)
+
+```
+
+Fig 3E
+```{r Extract gene subsets for heat1}
+
+#htShiny(ht1)
+
+last_genes_in_cluster <- c("Nsun2", "Hlcs","Lrp8", "Adam10", "F2r","Mgst2", "Cytip", "Ccl5", "Rnasel")
+
+cluster_borders <- data.frame("edge_gene" = last_genes_in_cluster, "dend_ind" = NA, "hm_ind" = NA, "cluster" = 1:length(last_genes_in_cluster))
+
+#Find the row index of the ordered heatmap that corresponds to the genes at the cluster edges
+for (i in 1:length(last_genes_in_cluster)) {
+  gene_i <- last_genes_in_cluster[i]
+  dend_index <- match(gene_i, labels(d1))
+  hm_index <- match(gene_i, rownames(heat1))
+  
+  cluster_borders$dend_ind[i] <- dend_index
+  cluster_borders$hm_ind[i] <- hm_index
+  
+}
+
+
+#Create data frame to store cluster IDs for each row
+row_split <- data.frame("gene" = rownames(heat1), "cluster" = NA)
+
+no_clusters <- length(last_genes_in_cluster)+1
+
+#Now assign each gene in the heatmap with its cluster ID
+for (i in 1:no_clusters) {
+  
+  #Get start and end indices for each cluster
+  if (i == 1) {
+    start <- 1
+    end <- cluster_borders$dend_ind[i]
+  } else if (i > 1 & i < no_clusters) {
+    start <- cluster_borders$dend_ind[i-1] + 1
+    end <- cluster_borders$dend_ind[i]
+  } else {
+    start <- cluster_borders$dend_ind[i-1] + 1
+    end <- length(labels(d1))
+  }
+  
+  #Which genes correspond to these indices?
+  cluster_i_genes <- labels(d1)[start:end]
+  
+  #Assign these genes as cluster i
+  row_split$cluster[which(row_split$gene %in% cluster_i_genes)] <- i
+
+}
+
+
+#Save as data frame to pass to heatmap
+split1 <- data.frame(row_split$cluster)
+rownames(split1) <- rownames(heat1)
+
+#group similar clusters
+split1$row_split.cluster[which(split1$row_split.cluster == 3)] <- 1
+split1$row_split.cluster[which(split1$row_split.cluster == 4)] <- 2
+split1$row_split.cluster[which(split1$row_split.cluster == 10)] <- 7
+
+
+#Re-order continuing from B2 cluster IDs (will subtract 12 below so the clusters start at 8)
+split1$row_split.cluster[which(split1$row_split.cluster == 5)] <- 20
+split1$row_split.cluster[which(split1$row_split.cluster == 1)] <- 21
+split1$row_split.cluster[which(split1$row_split.cluster == 2)] <- 22
+split1$row_split.cluster[which(split1$row_split.cluster == 8)] <- 23
+split1$row_split.cluster[which(split1$row_split.cluster == 6)] <- 24
+split1$row_split.cluster[which(split1$row_split.cluster == 9)] <- 25
+split1$row_split.cluster[which(split1$row_split.cluster == 7)] <- 26
+
+split1$row_split.cluster <- split1$row_split.cluster-12
+
+#Fig 3E
+set.seed(12)
+ht1 <- Heatmap(heat1,
+        col = col_heatdata,
+        clustering_distance_rows = "spearman",
+        cluster_rows = T,
+        row_split = split1,
+        cluster_row_slices = F,
+        show_row_dend = F,
+        show_column_dend = FALSE,
+        show_column_names = FALSE,
+        show_row_names = FALSE,
+        cluster_columns = F,
+        top_annotation = s2c_ha,
+        left_annotation = left_row_ha1,
+        row_title = NULL,
+        row_gap = unit(2, "mm"),
+        border = TRUE,
+        border_gp = gpar(col = "black"),
+        name = "log2 Exprs")
+
+draw(ht1)
+
+```
+
+Export final heatmaps
+```{r}
+
+col_heatdata = colorRamp2(c(-2, 0, 2), c(brewer.pal(7, "BrBG")[7], "white", brewer.pal(7, "BrBG")[1]))
+
+set.seed(12)
+ht1 <- Heatmap(heat1,
+               col = col_heatdata,
+               clustering_distance_rows = "spearman",
+               cluster_rows = T,
+               row_split = split1,
+               cluster_row_slices = F,
+               show_row_dend = F,
+               show_column_dend = FALSE,
+               show_column_names = FALSE,
+               show_row_names = FALSE,
+               cluster_columns = F,
+               top_annotation = s2c_ha,
+               left_annotation = left_row_ha1,
+               row_title = NULL,
+               row_gap = unit(2, "mm"),
+               border = TRUE,
+               border_gp = gpar(col = "black"),
+               use_raster = TRUE,
+               name = "log2 Exprs")
+
+ht2 <- Heatmap(heat2,
+               col = col_heatdata,
+               clustering_distance_rows = "spearman",
+               cluster_rows = T,
+               row_split = split2,
+               cluster_row_slices = F,
+               show_row_dend = F,
+               show_column_dend = FALSE,
+               show_column_names = FALSE,
+               show_row_names = FALSE,
+               cluster_columns = F,
+               top_annotation = s2c_ha,
+               left_annotation = left_row_ha2,
+               row_title = NULL,
+               row_gap = unit(2, "mm"),
+               border = TRUE,
+               border_gp = gpar(col = "black"),
+               use_raster = TRUE,
+               name = "log2 Exprs")
+
+
+
+pdf(file = "heat1+2.pdf", width = 3, height = 10)
+draw(ht2 %v% ht1)
+dev.off()
+
+pdf(file = "heat1.pdf", width = 3, height = 4)
+draw(ht1)
+dev.off()
+
+pdf(file = "heat2.pdf", width = 3, height = 4)
+draw(ht2)
+dev.off()
+
+```
+
+
+Modeling
+
+Signaling predictors from live imaging data
+```{r}
+#Load model predictors from live imaging data using inhibitors
+Inh_predictors <- readRDS("modeling_predictors.rds")
+
+```
+
+Signaling responses are the bulk RNAseq results above
+```{r}
+
+#Unscaled gene expression from bulk RNA seq with inhibitors
+#Use matrix from above
+responses <- as.data.frame(t(heatdata2))
+
+#Normalized expression by mean
+responses2 <- responses
+responses2["mean",] <- colMeans(responses2)
+
+responses3 <- apply(responses2, 2, FUN = function(x) {x/x[length(x)]})
+responses <- as.data.frame(responses3[1:8,])
+
+```
+
+Multiple linear regression
+```{r}
+
+## Turn this into a function for lapply ##
+
+#List to store model for each gene
+gene_fits <- list()
+
+#DF to store fit parameters
+fit_coeffs <- data.frame()
+
+select_best_fit = FALSE
+
+#Progress bar
+pb <- txtProgressBar(min = 0, max = length(colnames(responses)), initial = 0, style = 3) 
+
+for (g in colnames(responses)) {
+  
+  iteration <- match(g, colnames(responses))
+  setTxtProgressBar(pb,iteration)
+  
+  temp <- cbind(rbind(Inh_predictors, Inh_predictors), responses[,g])
+  colnames(temp)[3] <- "Expr"
+  
+  #Fit model
+  if (select_best_fit) {
+    m0 <- lm(Expr ~ ., data = temp)
+    best <- step(m0, scope = . ~ 1 ~ .^2, direction = 'both', trace = 0)
+  } else {
+    best <- lm(Expr ~ Erk * NFAT, data = temp)
+  }
+
+  #Save the best model
+  gene_fits[[g]] <- best
+  
+  #Store fit parameters
+  fit_coeffs[g,"Erkn"] <- coef(best)["Erk"]
+  fit_coeffs[g,"NFATn"] <- coef(best)["NFAT"]
+  fit_coeffs[g,"ErkNFATn"] <- coef(best)["Erk:NFAT"]
+  
+  fit_coeffs[g,"B0"] <- coef(best)["(Intercept)"]
+  fit_coeffs[g,"AIC"] <- AIC(best)
+  fit_coeffs[g,"R2"] <- summary(best)$adj.r.squared
+  fit_coeffs[g,"RSE"] <- summary(best)$sigma
+
+  if ("Erk" %in% names(best$coefficients)) {
+    fit_coeffs[g,"pErk"] <- round(summary(best)$coefficients["Erk", "Pr(>|t|)"], 5)
+    fit_coeffs[g,"Erkse"] <- round(summary(best)$coefficients["Erk", "Std. Error"], 4)
+  } else {
+    fit_coeffs[g,"pErk"] <- NA
+    fit_coeffs[g,"Erkse"] <- NA
+  }
+  
+  if ("NFAT" %in% names(best$coefficients)) {
+    fit_coeffs[g,"pNFAT"] <- round(summary(best)$coefficients["NFAT", "Pr(>|t|)"], 5)
+    fit_coeffs[g,"NFATse"] <- round(summary(best)$coefficients["NFAT", "Std. Error"], 4)
+  } else {
+    fit_coeffs[g,"pNFAT"] <- NA
+    fit_coeffs[g,"NFATse"] <- NA
+  }
+  
+  if ("Erk:NFAT" %in% names(best$coefficients)) {
+    fit_coeffs[g,"pErkNFAT"] <- round(summary(best)$coefficients["Erk:NFAT", "Pr(>|t|)"], 5)
+    fit_coeffs[g,"ErkNFATse"] <- round(summary(best)$coefficients["Erk:NFAT", "Std. Error"], 4)
+  } else {
+    fit_coeffs[g,"pErkNFAT"] <- NA
+    fit_coeffs[g,"ErkNFATse"] <- NA
+  }
+  
+
+}
+close(pb)
+
+fit_coeffs$gene <- rownames(fit_coeffs)
+
+```
+
+Save models
+```{r}
+
+saveRDS(fit_coeffs, "fit_coeffs_normalized.rds")
+write.csv(fit_coeffs, "/Users/matthewjwither/Desktop/GeneFits.csv")
+saveRDS(gene_fits, "gene_fits.rds")
+saveRDS(responses, "modeling_responses.rds")
+
+```
+
+Assign regulatory mode to each gene model
+```{r}
+#Rename beta coefficient data frame
+B <- fit_coeffs
+  
+#Add reguatory cluster ID to B data
+B$reg_cluster <- NA
+split1_ind <- match(rownames(split1), B$gene)
+split2_ind <- match(rownames(split2), B$gene)
+B$reg_cluster[split1_ind] <- split1$row_split.cluster
+B$reg_cluster[split2_ind] <- split2$row_split.cluster
+
+
+cluster_order <- c("A1", "A2", "A3", "A4", "R1", "R2", "R3", "A1w", "A3w", "A4w", "R1w", "R2w", "R3w", "I")
+
+
+B$reg_cluster[which(B$reg_cluster == 1)] <- "A1"
+B$reg_cluster[which(B$reg_cluster == 2)] <- "A2"
+B$reg_cluster[which(B$reg_cluster == 3)] <- "A3"
+B$reg_cluster[which(B$reg_cluster == 4)] <- "A4"
+B$reg_cluster[which(B$reg_cluster == 5)] <- "R1"
+B$reg_cluster[which(B$reg_cluster == 6)] <- "R2"
+B$reg_cluster[which(B$reg_cluster == 7)] <- "R3"
+
+B$reg_cluster[which(B$reg_cluster == 8)] <- "A1w"
+B$reg_cluster[which(B$reg_cluster == 9)] <- "A3w"
+B$reg_cluster[which(B$reg_cluster == 10)] <- "A4w"
+B$reg_cluster[which(B$reg_cluster == 11)] <- "I"
+B$reg_cluster[which(B$reg_cluster == 12)] <- "R1w"
+B$reg_cluster[which(B$reg_cluster == 13)] <- "R2w"
+B$reg_cluster[which(B$reg_cluster == 14)] <- "R3w"
+
+B$reg_cluster <- factor(B$reg_cluster, levels = cluster_order)
+B$cluster <- B$reg_cluster
+
+B$label <- NA
+label_ind <- match(GOIs, B$gene)
+B$label[label_ind] <- B$gene[label_ind]
+
+
+saveRDS(B,"Bdata.rds")
+
+
+```
+
+Plot beta coefficient boxplots - Fig 3F
+```{r}
+
+#Fig 3F
+B2 <- pivot_longer(B, cols = c("Erkn", "NFATn", "ErkNFATn"), names_to = "coeff")
+B2$coeff <- factor(B2$coeff, levels = c("NFATn", "Erkn", "ErkNFATn"))
+
+#split into separate weak and strong plots
+B2$category <- "weak"
+B2$category[which(B2$cluster %in% cluster_order[c(1:7)])] <- "strong"
+B2$category <- factor(B2$category, levels = c("strong", "weak"))
+
+ggplot(subset(B2, category == "strong"), aes(y = value, x = cluster, fill = coeff)) +
+  geom_boxplot(show.legend = F, outlier.size = 0.15) +
+  geom_hline(aes(yintercept = 0), linetype = "dashed") +
+  scale_fill_manual(values = c("#ca0020", "#0571b0", "purple")) +
+  coord_cartesian(ylim = c(-1, 2)) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.text.y = element_text(size = 16), axis.title = element_blank(),
+        axis.text.x = element_text(size = 14)) +
+  
+  ggplot(subset(B2, category == "weak"), aes(y = value, x = cluster, fill = coeff)) +
+  geom_boxplot(show.legend = F, outlier.size = 0.15) +
+  geom_hline(aes(yintercept = 0), linetype = "dashed") +
+  scale_fill_manual(values = c("#ca0020", "#0571b0", "purple")) +
+  coord_cartesian(ylim = c(-0.5, 0.75)) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.text.y = element_text(size = 16), axis.title = element_blank(),
+        axis.text.x = element_text(size = 14))
+
+
+
+
+
+```
+
+3D scatter plots/heatmaps for selected genes - Figure 3G
+```{r 3D scatter plot of fit}
+
+library(plot3D)
+
+responses3 <- as.data.frame(t(heatdata2))
+
+test_gene <- "Ctla2b"
+save_pdf <- TRUE
+
+temp <- cbind(rbind(Inh_predictors, Inh_predictors), responses3[,test_gene])
+colnames(temp)[3] <- "Expr"
+
+x <- temp$Erk
+y <- temp$NFAT
+z <- temp$Expr
+
+fit <- lm(z ~ x*y)
+#summary(fit)
+
+grid.lines = 40
+x.pred <- seq(min(x), max(x), length.out = grid.lines)
+y.pred <- seq(min(y), max(y), length.out = grid.lines)
+xy <- expand.grid( x = x.pred, y = y.pred)
+z.pred <- matrix(predict(fit, newdata = xy), nrow = grid.lines, ncol = grid.lines)
+
+#Invert matrix so that low NFAT low Erk is in the bottom left instead of top left
+z.pred <- apply(z.pred, 2, rev)
+
+
+fitpoints <- predict(fit)
+
+gene_fit_viridis <- viridis_pal(option = "D")(24)
+
+gene_fit_palette = colorRamp2(c(0, max(z.pred)/2, max(z.pred)), c(gene_fit_viridis[1], gene_fit_viridis[13], gene_fit_viridis[24]))
+gene_fit_palette(seq(-4, 4))
+
+ht <-   Heatmap(z.pred,
+                col <- gene_fit_palette,
+                cluster_rows = F, 
+                cluster_columns = F,
+                #column_title = "NFAT", 
+                #row_title = "Erk",
+                use_raster = F,
+                heatmap_legend_param = list(legend_height = unit(10, "cm"),grid_width = unit(1, "cm"), labels_gp = gpar(fontsize = 40)),
+                name = test_gene)
+
+#Set y minimum to 0 for all, scale max to each gene.
+
+if (save_pdf) {
+  
+  setwd("/Users/matthewjwither/Desktop")
+
+  pdf(file = paste0(test_gene,".pdf"), width = 6.6, height = 6)
+  
+  #Plot 3D scatter - Supplementary example PD-1
+  #-40 theta,10 phi for Pdcd1
+  #rotate theta 180 for repressed genes
+  # scatter3D(x, y, z, pch = 19, cex = 2, colvar = NULL, col="red", zlim = c(0,max(z)*1.2),
+  #           theta = -40, phi = 10, bty="b", box = TRUE, ticktype = "detailed",
+  #           xlab = "", ylab = "", zlab = "", add = F,
+  #           surf = list(x = x.pred, y = y.pred, z = z.pred,
+  #                       facets = TRUE, fit = fitpoints, col=ramp.col (col = c("dodgerblue3","seagreen2"), n = 300, alpha=0.75), border="black"), main = test_gene)
+  # 
+
+  draw(ht)
+  dev.off()
+
+}
+  
+  # scatter3D(x, y, z, pch = 19, cex = 2, colvar = NULL, col="red", zlim = c(0,max(z)*1.2),
+  #           theta = -40, phi = 10, bty="b", box = TRUE, ticktype = "detailed",
+  #           xlab = "", ylab = "", zlab = "", add = F,
+  #           surf = list(x = x.pred, y = y.pred, z = z.pred,
+  #                       facets = TRUE, fit = fitpoints, col=ramp.col (col = c("dodgerblue3","seagreen2"), n = 300, alpha=0.75), border="black"), main = test_gene)
+
+  
+draw(ht)
+
+
+```
+
+Extract fit parameters and create summary data frame for each regulatory mode
+```{r}
+
+B.split <- split(B, B$reg_cluster)
+B.summary <- data.frame(cluster = names(B.split))
+rownames(B.summary) <- names(B.split)
+
+for (i in names(B.split)) {
+  
+  temp <- B.split[[i]]
+  
+  EvEN_fit <- lm(ErkNFATn ~ Erkn, data = temp)
+  NvEN_fit <- lm(ErkNFATn ~ NFATn, data = temp)
+  
+  # B.summary[i,"Erkn"] <- mean(temp$Erkn)
+  # B.summary[i,"NFATn"] <- mean(temp$NFATn)
+  # B.summary[i,"ErkNFATn"] <- mean(temp$ErkNFATn)
+  # 
+  # B.summary[i,"ErkSD"] <- sd(temp$Erkn)
+  # B.summary[i,"NFATSD"] <- sd(temp$NFATn)
+  # B.summary[i,"ErkNFATSD"] <- sd(temp$ErkNFATn)
+  
+  B.summary[i,"NvEN_corr"] <- round(cor(temp$ErkNFATn, temp$NFATn), 2)
+  B.summary[i,"NvENm"] <- round(coef(NvEN_fit)["NFATn"], 2)
+  B.summary[i,"NvENo"] <- round(coef(NvEN_fit)["(Intercept)"],2)
+  # B.summary[i,"NvENm_se"] <- round(summary(NvEN_fit)$coefficients["NFATn", "Std. Error"], 4)
+  # B.summary[i,"NvENo_se"] <- round(summary(NvEN_fit)$coefficients["(Intercept)", "Std. Error"], 4)
+  
+  B.summary[i,"EvEN_corr"] <- round(cor(temp$ErkNFATn, temp$Erkn), 2)
+  B.summary[i,"EvENm"] <- round(coef(EvEN_fit)["Erkn"], 2)
+  B.summary[i,"EvENo"] <- round(coef(EvEN_fit)["(Intercept)"], 2)
+  # B.summary[i,"EvENm_se"] <- round(summary(EvEN_fit)$coefficients["Erkn", "Std. Error"], 4)
+  # B.summary[i,"EvENo_se"] <- round(summary(EvEN_fit)$coefficients["(Intercept)", "Std. Error"], 4)
+  
+}
+
+B.summary$cluster <- NULL
+
+
+#Export table
+pdf("FigS3E.pdf", height=3.5, width=6)
+grid.table(B.summary)
+dev.off()
+
+
+```
+
+Scatterplots for each regulatory mode - Fig 3H and S3D
+```{r}
+scatter_by_cluster <- function(df, df2, clust, basename, fontsize = 12, out_dir) {
+  
+  setwd(out_dir)
+  
+  clust_name <- levels(df$cluster)[clust]
+  
+  grob2 <- grobTree(textGrob(paste0("Corr = ", as.character(round(df2$NvEN_corr[match(clust_name,rownames(df2))],2))),
+                             x=0.5,  y=0.9, hjust=0, gp=gpar(col="black", fontsize=fontsize*.85)))
+  
+  grob3 <- grobTree(textGrob(paste0("Corr = ", as.character(round(df2$EvEN_corr[match(clust_name,rownames(df2))],2))),
+                             x=0.5,  y=0.9, hjust=0, gp=gpar(col="black", fontsize=fontsize*.85)))
+  
+  
+  plot1 <- ggplot(data = subset(df, cluster == clust_name), aes(y = Erkn, x = NFATn, label = ifelse(cluster == clust_name,as.character(label),''))) +
+    geom_point(data = subset(B, cluster != clust_name), color = "grey", size = 1, alpha = 0.6) +
+    geom_point(color = "red", size = 2.5, alpha = 1) +
+    geom_vline(aes(xintercept = 0), linetype = "dashed") +
+    geom_hline(aes(yintercept = 0), linetype = "dashed") +
+    geom_text_repel(color = "black", size = 8, max.overlaps = Inf, min.segment.length = unit(0.2, 'lines')) +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          axis.text.y = element_text(size = fontsize, face = "bold"), axis.text.x = element_text(size = fontsize, face = "bold"),
+          axis.title = element_blank())
+  
+  pdf(file = paste0(basename, "_EvN_", as.character(clust), ".pdf"), width = 4, height = 4)
+  print(plot1)
+  dev.off()
+  
+  plot2 <- ggplot(data = subset(df, cluster == clust_name), aes(y = ErkNFATn, x = NFATn, label = ifelse(cluster == clust_name,as.character(label),''))) +
+    geom_point(data = subset(B, cluster != clust_name), color = "grey", size = 1, alpha = 0.6) +
+    geom_point(color = "red", size = 2.5, alpha = 1) +
+    geom_vline(aes(xintercept = 0), linetype = "dashed") +
+    geom_hline(aes(yintercept = 0), linetype = "dashed") +
+    geom_smooth(method = "lm", se = FALSE, color = "black", size = 0.8) +
+    #stat_regline_equation(aes(label = ..eq.label..), label.y = 1, size = fontsize*.4) +
+    #stat_regline_equation(aes(label = ..rr.label..), label.y = 0.8, size = fontsize*.4) +
+    annotation_custom(grob2) +
+    geom_text_repel(color = "black", size = 8, max.overlaps = Inf, min.segment.length = unit(0.2, 'lines')) +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          axis.text.y = element_text(size = fontsize, face = "bold"), axis.text.x = element_text(size = fontsize, face = "bold"),
+          axis.title = element_blank())
+  
+  pdf(file = paste0(basename, "_ENvN_", as.character(clust), ".pdf"), width = 4, height = 4)
+  print(plot2)
+  dev.off()
+  
+  plot3 <- ggplot(data = subset(df, cluster == clust_name), aes(y = ErkNFATn, x = Erkn, label = ifelse(cluster == clust_name,as.character(label),''))) +
+    geom_point(data = subset(B, cluster != clust_name), color = "grey", size = 1, alpha = 0.6) +
+    geom_point(color = "red", size = 2.5, alpha = 1) +
+    geom_vline(aes(xintercept = 0), linetype = "dashed") +
+    geom_hline(aes(yintercept = 0), linetype = "dashed") +
+    geom_smooth(method = "lm", se = FALSE, color = "black", size = 0.8) +
+    #stat_regline_equation(aes(label = ..eq.label..), label.y = 1, size = fontsize*.4) +
+    #stat_regline_equation(aes(label = ..rr.label..), label.y = 0.8, size = fontsize*.4) +
+    annotation_custom(grob3) +
+    geom_text_repel(color = "black", size = 8, max.overlaps = Inf, min.segment.length = unit(0.2, 'lines')) +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          axis.text.y = element_text(size = fontsize, face = "bold"), axis.text.x = element_text(size = fontsize, face = "bold"),
+          axis.title = element_blank())
+  
+  pdf(file = paste0(basename, "_EvEN_", as.character(clust), ".pdf"), width = 4, height = 4)
+  print(plot3)
+  dev.off()
+  
+}
+
+out_dir <- "/Users/matthewjwither/Desktop/Scatterplots"
+
+for (i in 1:14){
+  scatter_by_cluster(df = B, df2 = B.summary, clust = i, basename = "FigS3D", out_dir = out_dir, fontsize = 20)
+}
+
+```
+
+Venn diagram of NFAT/Erk regulation
+```{r}
+library(sleuth)
+
+so <- sleuth_load("RNAseqInhibitorAssay")
+
+#Perform wald test for each sample against the dual inhibitor (control condition set in the sleuth prep step above)
+so <- sleuth_wt(so, which_beta = 'conditionMEKi')
+so <- sleuth_wt(so, which_beta = 'conditionCsA')
+so <- sleuth_wt(so, which_beta = 'condition2pmol')
+
+qval_thresh <- 0.001
+
+sleuth_results_MEKi <- sleuth_results(so, test = 'conditionMEKi', show_all = FALSE)
+sleuth_MEKi_sig <- subset(sleuth_results_MEKi, qval <= qval_thresh)
+
+
+sleuth_results_CsA <- sleuth_results(so, test = 'conditionCsA', show_all = FALSE)
+sleuth_CsA_sig <- subset(sleuth_results_CsA, qval <= qval_thresh)
+
+
+sleuth_results_DMSO_2pmol <- sleuth_results(so, test = 'condition2pmol', show_all = FALSE)
+sleuth_DMSO_2pmol_sig <- subset(sleuth_results_DMSO_2pmol, qval <= qval_thresh)
+
+#These are filtered on DEGs from bulk analysis that also pass QC from scRNA seq
+Ereg <- sleuth_CsA_sig$gene[which(sleuth_CsA_sig$gene %in% B$gene)]
+Nreg <- sleuth_MEKi_sig$gene[which(sleuth_MEKi_sig$gene %in% B$gene)]
+ENreg <- sleuth_DMSO_2pmol_sig$gene[which(sleuth_DMSO_2pmol_sig$gene %in% B$gene)]
+
+cat_names <- c(paste0("Erk (", length(Ereg), ")"),
+               paste0("NFAT (", length(Nreg), ")"),
+               paste0("Erk+NFAT (", length(ENreg), ")"))
+venn <- venn.diagram(x = list(Ereg, Nreg, ENreg),
+                     category.names = cat_names,
+                     filename = NULL,
+                     cex = 1,
+                     cat.cex = 1,
+                     lwd = 2)
+grid.draw(venn)
+
+```
+
+Example B coeff table
+```{r}
+
+test_gene <- "Pdcd1"
+temp <- cbind(rbind(Inh_predictors, Inh_predictors), responses[,test_gene]) %>% round(2)
+colnames(temp)[3] <- "Expr"
+
+grid.table(temp)
+
+
+```
+
+Export DEG lists
+```{r}
+
+#These are all DEGs from bulk RNAseq dataset
+Ereg <- subset(sleuth_CsA_sig, gene %in% sleuth_significant$gene)
+Nreg <- subset(sleuth_MEKi_sig, gene %in% sleuth_significant$gene)
+ENreg <- subset(sleuth_DMSO_2pmol_sig, gene %in% sleuth_significant$gene)
+
+#Flag genes not present in scRNAseq data
+Ereg$scRNAseq <- Nreg$scRNAseq <- ENreg$scRNAseq <- 0
+
+Ereg$scRNAseq[which(Ereg$gene %in% B$gene)] <- 1
+Nreg$scRNAseq[which(Nreg$gene %in% B$gene)] <- 1
+ENreg$scRNAseq[which(ENreg$gene %in% B$gene)] <- 1
+
+write.csv(Ereg, "/Users/matthewjwither/Desktop/CsA_DEGs.csv")
+write.csv(Nreg, "/Users/matthewjwither/Desktop/MEKi_DEGs.csv")
+write.csv(ENreg, "/Users/matthewjwither/Desktop/DMSO_DEGs.csv")
+
+
+
+```
+

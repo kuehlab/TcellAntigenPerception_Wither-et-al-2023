@@ -1,0 +1,218 @@
+---
+title: "Modeling"
+author: "Matthew Wither"
+date: "3/1/23"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+
+Load packages and user-defined functions
+```{r}
+suppressPackageStartupMessages(library(ComplexHeatmap))
+library(viridis)
+library(circlize)
+library(dplyr)
+library(tidyr)
+
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+  return(data_sum)
+}
+
+```
+
+Experimental results
+```{r}
+
+arm1 <- read.csv("/Users/brittanymarcelo/Desktop/R/PD1_CD25_Data/data_arm1.csv")[1:37,2:5]
+arm2 <- read.csv("/Users/brittanymarcelo/Desktop/R/PD1_CD25_Data/data_arm2.csv")[1:48,2:5]
+
+arm1$arm <- 1
+arm2$arm <- 2
+
+arm1$Cond <- c(rep(rep(c("20A", "2A", "02A", "20PA"), each = 3),3), "Rest")
+arm2$Cond <- rep(rep(c("20A", "2A", "02A", "20PA"), each = 3),4)
+
+arm1$treatment <- c(rep(c("DMSO", "CsA", "MEKi"), each = 12), "Rest")
+arm2$treatment <- rep(c("DMSO", "CsA", "MEKi", "CsA+MEKi"), each = 12)
+
+data <- bind_rows(arm1,arm2)
+
+#duplicate rest for arm2
+data <- rbind(data, data[which(data$Cond == "Rest"),])
+data[length(rownames(data)),"arm"] <- 2
+data$treatment[which(data$Cond == "Rest")] <- "DMSO"
+
+data$Cond <- factor(data$Cond, levels = c("20A", "2A", "02A", "20PA", "Rest"))
+data$treatment <- factor(data$treatment, levels = c("DMSO", "CsA", "MEKi", "CsA+MEKi"))
+data$arm <- factor(data$arm)
+
+#Format for Heatmaps - each gene has its own matrix
+arm1_hm <- list()
+arm2_hm <- list()
+conditions_labels <- list()
+
+for (gene in c("PD1", "CD25_ON", "CD25")) {
+  temp1 <- subset(data, arm == 1)[,c(gene, "Cond", "treatment")]
+  temp1$ID <- paste(temp1$Cond, c(rep(1:3, 12), 1), sep = "_")
+  temp1$Cond <- NULL
+  temp1 <- as.data.frame(pivot_wider(temp1, names_from = treatment, values_from = gene))
+  rownames(temp1) <- temp1$ID
+  temp1$ID <- NULL
+  temp1["Rest_1",] <- temp1["Rest_1",1]
+  
+  temp2 <- subset(data, arm == 2)[,c(gene, "Cond", "treatment")]
+  temp2$ID <- paste(temp2$Cond, c(rep(1:3, 16), 1), sep = "_")
+  temp2$Cond <- NULL
+  temp2 <- as.data.frame(pivot_wider(temp2, names_from = treatment, values_from = gene))
+  rownames(temp2) <- temp2$ID
+  temp2$ID <- NULL
+  temp2["Rest_1",] <- temp2["Rest_1",1]
+  
+  arm1_hm[[gene]] <- as.matrix(temp1)
+  arm2_hm[[gene]] <- as.matrix(temp2)
+  
+}
+
+cond1 <- subset(data, arm == 1 & treatment == "DMSO")[,c("Cond", "treatment")]
+pMHC_labels <- rowAnnotation(Cond = factor(cond1$Cond, 
+                                           levels = c("20A", "2A", "02A", "20PA", "Rest")),
+                              col = list(Cond = c("20A" = "darkorchid3",
+                                                     "2A" = "mediumorchid2",
+                                                     "02A" = "plum1",
+                                                     "20PA" = "sandybrown",
+                                                     "Rest" = "grey60")),
+                              simple_anno_size = unit(3, "mm"),
+                              show_annotation_name = FALSE, show_legend = F)
+
+
+```
+
+PD-1 model
+```{r}
+
+pd1model <- as.matrix(read.csv("/Users/matthewjwither/Desktop/R/PD1_CD25_Data/PD1 modeling result.csv",row.names = 1))
+colnames(pd1model)[4] <- "CsA+MEKi"
+
+#create 2 dummy replicates for each condition from modeling to match the rows of the experimental results in order to merge the matrices.
+pd1_3 <- pd1model[rep(seq_len(nrow(pd1model)), each = 3), ]
+
+#Create dummy rest condition
+pd1_3 <- rbind(pd1_3, pd1_3[1,])
+
+#mirror row names
+rownames(pd1_3) <- rownames(arm1_hm[["PD1"]])
+
+#Set dummy rest values to NA
+pd1_3["Rest_1",] <- NA
+
+#Merge matrices
+PD1_full <- cbind(arm1_hm[["PD1"]], arm2_hm[["PD1"]], pd1_3)
+
+
+```
+
+CD25 model
+```{r}
+
+cd25model <- as.data.frame(read.csv("/Users/matthewjwither/Desktop/R/PD1_CD25_Data/CD25 modeling result.csv",row.names = 1))
+colnames(cd25model)[4] <- "CsA+MEKi"
+
+#split by arm
+cd25model <- split(cd25model, cd25model$Arm)
+
+#Format matrix the same as for PD1 above.
+cd25_3 <- lapply(cd25model, function(x) { 
+  x <- x[rep(seq_len(nrow(x)), each = 3), ]
+  x <- rbind(x, x[1,])
+  rownames(x) <- rownames(arm1_hm[["CD25"]])
+  x["Rest_1",] <- NA
+  x[,"Arm"] <- NULL
+  x
+})
+
+#Need to merge each arm separately because metric is different for each
+CD25_full_arm1 <- as.matrix(cbind(arm1_hm[["CD25_ON"]]/100, cd25_3[["1"]][,-4]))
+CD25_full_arm2 <- as.matrix(cbind(arm2_hm[["CD25"]], cd25_3[["2"]]))
+
+```
+
+Export heatmaps
+```{r}
+
+setwd("/Users/matthewjwither/Desktop")
+
+pdf(file = "PD1_complete.pdf", width = 6, height = 4)
+draw(Heatmap(PD1_full,
+        col = viridis_pal(option = "D")(24),
+        cluster_rows = F,
+        cluster_columns = F,
+        show_row_names = F,
+        row_title = NULL,
+        column_title = c("Early (Exp.)", "Late (Exp.)", "Late (Model)"),
+        row_split = cond1$Cond,
+        column_split = c(1,1,1,2,2,2,2,3,3,3,3),
+        column_names_rot = 45,
+        left_annotation = pMHC_labels,
+        row_gap = unit(0.5, "mm"),
+        column_gap = unit(10, "mm"),
+        column_names_side = "top",
+        heatmap_legend_param = list(direction = "horizontal"),
+        name = "PD1 MFI"), 
+     
+     heatmap_legend_side="bottom")
+
+dev.off()
+
+
+pdf(file = "CD25_complete.pdf", width = 8, height = 4)
+draw(Heatmap(CD25_full_arm1,
+        col = viridis_pal(option = "D")(24),
+        cluster_rows = F,
+        cluster_columns = F,
+        show_row_names = F,
+        row_title = NULL,
+        column_title = c("Early (Exp.)", "Early (Model)"),
+        row_split = cond1$Cond,
+        column_split = c(1,1,1,2,2,2),
+        column_names_rot = 45,
+        left_annotation = pMHC_labels,
+        row_gap = unit(0.5, "mm"),
+        column_gap = unit(10, "mm"),
+        column_names_side = "top",
+        heatmap_legend_param = list(direction = "horizontal"),
+        name = "Fraction CD25 ON") +
+       
+     Heatmap(CD25_full_arm2,
+        col = viridis_pal(option = "D")(24),
+        cluster_rows = F,
+        cluster_columns = F,
+        show_row_names = F,
+        row_title = NULL,
+        column_title = c("Late (Exp.)", "Late (Model)"),
+        row_split = cond1$Cond,
+        column_split = c(1,1,1,1,2,2,2,2),
+        column_names_rot = 45,
+        left_annotation = pMHC_labels,
+        row_gap = unit(0.5, "mm"),
+        column_gap = unit(10, "mm"),
+        column_names_side = "top",
+        heatmap_legend_param = list(direction = "horizontal"),
+        name = "CD25 MFI"), 
+     
+     heatmap_legend_side="bottom")
+
+dev.off()
+
+
+```
+

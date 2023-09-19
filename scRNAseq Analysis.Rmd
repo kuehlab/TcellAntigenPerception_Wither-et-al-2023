@@ -1,0 +1,1691 @@
+---
+title: "10x scRNAseq Analysis"
+author: "Matthew Wither"
+date: "5/31/22"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+Load packages and user-defined functions
+```{r, eval = FALSE}
+library(RColorBrewer)
+library(dplyr)
+library(ggrepel)
+suppressPackageStartupMessages(library(ComplexHeatmap))
+library(InteractiveComplexHeatmap)
+library(clusterProfiler)
+library(enrichplot)
+library(ggplot2)
+library(gridExtra)
+library(msigdbr)
+library(ggforce)
+library(patchwork)
+library(monocle3)
+library(ggpubr)
+library(stringi)
+library(viridis)
+library(caret)
+library(tidyr)
+library(circlize)
+library(ggridges)
+library(plotly)
+library(glmnet)
+library(pbmcapply)
+library(ClassDiscovery)
+library(dendextend)
+library(ggdensity)
+library(DescTools)
+library(VennDiagram)
+
+
+get_covariance_bootstrap_pval <- function(df, metric, scale_metrics = TRUE, iterations = 10000) {
+  
+  top_genes <- rownames(df)
+  
+  #Get number of genes per cluster for standard sampling
+  genes_per_cluster <- subset(df, !is.na(lasso_clust)) %>% dplyr::count(lasso_clust, sort = F)
+  
+  #covariance + means
+  cov_raw <- data.frame(lasso_clust = 1:8)
+  
+  all_metrics <- c("mNFAT", "mErk", "mErkNFAT", "mNEratio", "covNvE", "covNvEN", "covEvEN", "corNvE", "corNvEN", "corEvEN")
+  
+  # assertthat::assert_that(metric %in% all_metrics, 
+  #                         msg = paste0("Specified metric msut be one of ", all_metrics))
+  
+  
+  for (i in 1:8) {
+    
+    #Mean betas
+    temp_means <- colMeans(subset(df, lasso_clust == i)[,c(1:3,5)])
+    
+    #Covariances
+    temp_cov <- cov(subset(df, lasso_clust == i)[,1:3])
+    temp_cov <- temp_cov[lower.tri(temp_cov)]
+    
+    #Pearson correlation (i.e covariance normalized by variance)
+    temp_correlation <- cor(subset(df, lasso_clust == i)[,1:3])
+    temp_correlation <- temp_correlation[lower.tri(temp_correlation)]
+    
+    cov_raw[i,all_metrics] <- c(temp_means, temp_cov, temp_correlation)
+  }
+  
+  cov_raw$lasso_clust <- NULL
+  
+  #scale if needed
+  cov_scaled <- scale(cov_raw, center = scale_metrics, scale = scale_metrics)
+  
+  
+  #Initialize covariance distance matrices for true and shuffled values
+  true_dist_matrix <- matrix(data = NA, nrow = 8, ncol = 8)
+  colnames(true_dist_matrix) <- rownames(true_dist_matrix) <- 1:8
+  
+  for (i in 1:8) {
+    for (j in 1:8) {
+      true_cov <- list()
+      true_cov[[1]] <- cov_scaled[i,metric]
+      true_cov[[2]] <- cov_scaled[j,metric]
+      true_dist_matrix[i,j] <- cov_distance(true_cov)
+    }
+  }
+  
+
+  #Now Compute covariance random clusters to generate background distances
+  
+  shuffle_dist_matrix <- array(numeric(),c(8,8,iterations)) 
+  
+  #Bootstrap 10k iterations
+  pb <- progressBar(min = 0, max = iterations, initial = 0, style = "ETA")
+  for (b in 1:iterations) {
+    
+    #covariance + means
+    cov_raw_shuffled <- data.frame(lasso_clust = 1:8)
+    
+    for (c in 1:8) {
+      
+      #randomly sample genes
+      sample_c <- sample(rownames(df), size = genes_per_cluster$n[c], replace = T)
+      
+      temp_means <- colMeans(df[sample_c,c(1:3,5)])
+      
+      temp_cov <- cov(df[sample_c,1:3])
+      temp_cov <- temp_cov[lower.tri(temp_cov)]
+      
+      temp_correlation <- cor(df[sample_c,1:3])
+      temp_correlation <- temp_correlation[lower.tri(temp_correlation)]
+      
+      cov_raw_shuffled[c,all_metrics] <- c(temp_means, temp_cov, temp_correlation)
+      
+    }
+    
+    cov_raw_shuffled$lasso_clust <- NULL
+    
+    #scale if needed
+    cov_scaled_shuffled <- scale(cov_raw_shuffled, center = scale_metrics, scale = scale_metrics)
+    
+    
+    for (i in 1:8) {
+      for (j in 1:8) {
+        shuffled_cov <- list()
+        shuffled_cov[[1]] <- cov_scaled_shuffled[i,metric]
+        shuffled_cov[[2]] <- cov_scaled_shuffled[j,metric]
+        shuffle_dist_matrix[i,j,b] <- cov_distance(shuffled_cov)
+      }
+    }
+    
+    setTxtProgressBar(pb,b)
+  }
+  close(pb)
+  
+  #Get p values for covariance similarity
+  out_pval_matrix <- true_dist_matrix
+  for (i in 1:8) {
+    for (j in 1:8) {
+      out_pval_matrix[i,j] <- 1-ecdf(shuffle_dist_matrix[i,j,])(true_dist_matrix[i,j])
+    }
+  }
+  
+  out_pval_matrix
+  
+}
+
+get_summary_stats_random_distributions <- function(df, summary_df, iterations = 10000) {
+  
+  #Get number of genes per cluster for standard sampling
+  genes_per_cluster <- subset(df, !is.na(lasso_clust)) %>% dplyr::count(lasso_clust, sort = F)
+  
+  all_metrics <- colnames(summary_df)
+  
+  #Now compute background distributions
+  
+  random_distributions <- array(numeric(),c(8,length(all_metrics),iterations)) 
+  
+  #Bootstrap 10k iterations
+  pb <- progressBar(min = 0, max = iterations, initial = 0, style = "ETA")
+  for (b in 1:iterations) {
+    
+    #covariance + means
+    cov_raw_shuffled <- data.frame(lasso_clust = 1:8)
+    
+    for (c in 1:8) {
+      
+      #randomly sample genes
+      sample_c <- sample(rownames(df), size = genes_per_cluster$n[c], replace = T)
+      
+      #Mean betas
+      temp_means <- colMeans(df[sample_c,c(1:3)])
+      
+      #Cov and Var
+      temp_cov <- cov(df[sample_c,1:3])
+      temp_var <- diag(temp_cov)
+      
+      temp_cov <- temp_cov[lower.tri(temp_cov)]
+      
+      temp_correlation <- cor(df[sample_c,1:3])
+      temp_correlation <- temp_correlation[lower.tri(temp_correlation)]
+      
+      cov_raw_shuffled[c,all_metrics] <- c(temp_means, temp_var, temp_cov, temp_correlation)
+      
+    }
+    
+    cov_raw_shuffled$lasso_clust <- NULL
+    
+    random_distributions[,,b] <- scale(cov_raw_shuffled, center = FALSE, scale = FALSE)
+    
+    
+    setTxtProgressBar(pb,b)
+  }
+  close(pb)
+  
+  random_distributions
+  
+}
+
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+
+#Gene link LASSO Regression functions (Cao et al.)
+do_lasso <- function(gene_matrix, gene_vector, seed = 1) {
+  
+  M1 = gene_matrix
+  y = gene_vector
+  
+  set.seed(seed)
+  cv.out1 = cv.glmnet(M1, y, alpha=1, lambda=exp(seq(log(0.001), log(10), length.out=100)))
+  r2_1 = r2_glmnet(cv.out1, y)
+  
+  bestlam = cv.out1$lambda.1se
+  cor_list = coef(cv.out1, s= bestlam)
+  cor_length = length(cor_list)
+  df_cor = data.frame("id" = row.names(cor_list)[2:cor_length], "corcoef" = cor_list[2:cor_length])
+  return(list(r2_1, df_cor))
+}
+
+r2_glmnet <- function(cv.out, y) {
+  bestlam = cv.out$lambda.1se
+  i = which(cv.out$lambda == bestlam)
+  e <- cv.out$cvm[i]
+  r2 <- 1 - e / var(y)
+  if(r2 < 0)
+  {
+    r2 = 0
+  }
+  return(r2)
+}
+
+#Function to pick top effect from pairwise comparisons
+pick_greater_effect <- function(x) {
+  x2 <- abs(x)
+  greater <- max(x2)
+  index <- match(greater, x2)
+  return(x[index])
+}
+
+#Scale data between 0 and 1
+range01 <- function(x){(x-min(x))/(max(x)-min(x))}
+
+theme_set(theme_bw())
+
+main_dir <- "/Users/matthewjwither/Desktop/analysis_objects/"
+conditions_10x <- c("Rest", "20pmolA", "2pmolA", "02pmolA", "80pmolPA", "20pmolPA")
+viridis_palette <- rev(viridis_pal()(7))
+regulon_colors <- brewer.pal(8, "Set1")
+scatter_colors_alternate <-c("02pmolA" = "plum1", "2pmolA" = "mediumorchid2", "20pmolA" = "darkorchid3", "20pmolPA" = "#E38E14", "80pmolPA" = "#A17339", "Rest" = "grey60")
+
+setwd(main_dir)
+
+
+```
+
+----------------------------------------------------------------
+Load objects
+```{r}
+
+cds3 <- readRDS("cds3.rds")
+rData1 <- as.data.frame(rowData(cds3))
+pData1 <- as.data.frame(colData(cds3))
+
+regulons_final <- readRDS(paste0(main_dir, "regulons_final.rds"))
+regulon_colors <- brewer.pal(8, "Set1")
+
+#Cells per condition analyzed
+sc_counts <- as.data.frame(table(pData1[,c("Cond")]))
+
+```
+
+Plot UMAP clusters
+```{r}
+
+viridis_palette <- rev(viridis_pal()(7))
+
+plot_cells(cds3, color_cells_by = "new_cluster", label_cell_groups = F, group_label_size = 8) + 
+  scale_color_manual(values = c("grey", viridis_palette)) +
+  guides(color = guide_legend(title = "Cluster", override.aes = list(size = 4)))
+
+```
+
+Plot UMAP by condition
+```{r}
+
+colData(cds3)$Cond <- factor(pData1$Cond, levels = c("Rest", "20pmolPA", "80pmolPA", "02pmolA", "2pmolA", "20pmolA"))
+
+plot_cells(cds3, color_cells_by = "Cond", cell_size = 0.2, label_cell_groups = F) + scale_color_manual(values = rep("thistle", 6)) + facet_wrap(~Cond, nrow = 1)
+
+setwd("/Users/matthewjwither/Desktop")
+pdf(file = "Fig4b_size005.pdf", width = 9.92, height = 2.03)
+plot_cells(cds3, color_cells_by = "Cond", cell_size = 0.05, label_cell_groups = F) + scale_color_manual(values = scatter_colors_alternate) + facet_wrap(~Cond, nrow = 1) + theme(legend.position = "none")
+dev.off()
+
+#Export PDF with dims 9.92x2.03 inches
+
+```
+
+Calculate fraction of cells from each condition within each UMAP cluster
+```{r}
+
+#Split by condition
+condition_split <- split(pData1, pData1$Cond)
+
+#output list
+fractional_comp_by_cluster <- list()
+
+for (i in names(condition_split)) {
+  df <- condition_split[[i]]
+  total_barcodes <- length(df$barcode)
+  
+  df.split <- split(df, df$new_cluster)
+  
+  frac_comp <- data.frame("cluster" = names(df.split), "frac" = NA, "Cond" = i)
+  
+  for (j in 1:length(names(df.split))) {
+    temp <- df.split[[j]]
+    no_barcodes <- length(temp$barcode)
+    
+    frac_comp$frac[j] <- no_barcodes/total_barcodes
+
+  }
+  
+  fractional_comp_by_cluster[[i]] <- frac_comp
+  rm(df.split)
+  rm(df)
+  rm(temp)
+}
+
+fractional_compositions <- bind_rows(fractional_comp_by_cluster)
+fractional_compositions$cluster <- factor(fractional_compositions$cluster)
+fractional_compositions$Cond <- factor(fractional_compositions$Cond, levels = c(conditions_10x[-1], conditions_10x[1]))
+
+#Figure 4B
+ggplot(data = fractional_compositions, aes(x = Cond, y = frac, fill = factor(cluster))) +
+  geom_bar(position="stack", stat = "identity", color = "darkgrey", size = 0, show.legend = F) +
+  #facet_wrap(~Cond, nrow = 1, scales = "free") +
+  labs(x = NULL, y = "Fraction") +
+  coord_flip() +
+  scale_fill_manual(values = c("grey", viridis_palette)) +
+  scale_y_continuous(limits = c(0, 1), breaks = c(0,0.5,1)) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1), 
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+
+
+```
+
+Plot select genes on UMAP
+```{r}
+
+#Supplementary genes
+marker_genes_to_show <- c("Tcf7", "Klf2", "Ccl3",  "Lag3", "Tnfrsf4", "Cd200", "Il2rb")
+
+#Main figure genes
+marker_genes_to_show <- c("Irf4", "Il2ra", "Pdcd1", "Ccl4", "Ctla4", "Cd47", "Sell")
+
+plot_cells(cds3, genes = marker_genes_to_show,
+             show_trajectory_graph = F, label_cell_groups = F, scale_to_range = F, norm_method = "log",
+           cell_size = 0.3, alpha = 0.5, rasterize = F) + scale_color_viridis(option = "C", direction = 1, name = "Expr", limits = c(-0.1,1.5))
+
+
+#Plot bar charts of composition
+
+#pseudobulk by cluster
+pseudobulk <- aggregate_gene_expression(cds3, cell_group_df = pData1[,c("barcode", "new_cluster")], norm_method = "log", scale_agg_values = T)
+
+#Swap target id for gene short name
+id2g <- as.data.frame(rowData(cds3))
+old_row_names <- rownames(pseudobulk)
+new_row_names <- match(old_row_names, id2g$id)
+rownames(pseudobulk) <- id2g$gene_short_name[new_row_names]
+
+goi_bar <- as.data.frame(pseudobulk[marker_genes_to_show,])
+goi_bar$gene <- rownames(goi_bar)
+goi_bar <- pivot_longer(goi_bar, cols = 1:8, names_to = "cluster")
+goi_bar$gene <- factor(goi_bar$gene, levels = marker_genes_to_show)
+
+
+ggplot(goi_bar, aes(x = cluster, y = value, fill = cluster)) +
+  geom_bar(stat="identity", position = position_dodge()) +
+  scale_fill_manual(values = c("grey", viridis_palette)) +
+  facet_wrap(~gene) +
+  ylab("Aggregate Expr") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+#pseudobulk by pMHC
+pseudobulk <- aggregate_gene_expression(cds3, cell_group_df = pData1[,c("barcode", "Cond")], norm_method = "log", scale_agg_values = T)
+
+#Swap target id for gene short name
+id2g <- as.data.frame(rowData(cds3))
+old_row_names <- rownames(pseudobulk)
+new_row_names <- match(old_row_names, id2g$id)
+rownames(pseudobulk) <- id2g$gene_short_name[new_row_names]
+
+goi_bar <- as.data.frame(pseudobulk[marker_genes_to_show,])
+goi_bar$gene <- rownames(goi_bar)
+goi_bar <- pivot_longer(goi_bar, cols = 1:6, names_to = "Cond")
+goi_bar$Cond <- factor(goi_bar$Cond, levels = c("Rest", "20pmolPA", "80pmolPA", "02pmolA", "2pmolA", "20pmolA"))
+
+ggplot(goi_bar, aes(x = Cond, y = value, fill = Cond)) +
+  geom_bar(stat="identity", position = position_dodge()) +
+  scale_fill_manual(values = scatter_colors_alternate) +
+  facet_wrap(~gene) +
+  ylab("Aggregate Expr") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+```
+
+----------------------------------------------------------------
+DEG testing
+
+Affinity DEGs
+```{r DEG}
+
+#Compare high dose high affinity to high dose low affinity (i.e CD69 saturation conditions)
+affinity_cells <- row.names(subset(pData1, Cond %in% conditions_10x[c(2,3,5,6)]))
+cds4 <- cds3[,affinity_cells]
+
+#DEGs acrosss different affinity peptides
+affinityDEGs <- fit_models(cds4, model_formula_str = "~Affinity")
+
+DEG_coeffs <- coefficient_table(affinityDEGs)
+good_fits <- subset(DEG_coeffs, status == "OK" & term != "(Intercept)" & q_value < 0.05)
+good_fits <- dplyr::select(good_fits, gene_short_name, q_value, normalized_effect)
+
+#results <- subset(DEG_coeffs, status == "OK" & term != "(Intercept)")
+#results <- dplyr::select(results, gene_short_name, q_value, normalized_effect)
+
+aff_fits <- good_fits[order(good_fits$normalized_effect),]
+aff_fits$normalized_effect <- aff_fits$normalized_effect*-1
+aff_fits <- as.data.frame(aff_fits)
+rownames(aff_fits) <- aff_fits$gene_short_name
+
+rm(cds4)
+rm(DEG_coeffs)
+rm(affinityDEGs)
+rm(good_fits)
+
+saveRDS(aff_fits, paste0(main_dir, "aff_fits_ErkNFAT.rds"))
+
+```
+
+Dose DEGs
+```{r}
+#Select agonist conditions
+agonist_cells <- row.names(subset(pData1, Cond %in% conditions_10x[2:4]))
+cds4 <- cds3[,agonist_cells]
+
+#DEGs acrosss different doses of agonist peptide
+doseDEGs <- fit_models(cds4, model_formula_str = "~Dose")
+
+DEG_coeffs <- coefficient_table(doseDEGs)
+good_fits <- subset(DEG_coeffs, status == "OK" & term != "(Intercept)" & q_value < 0.05)
+good_fits <- dplyr::select(good_fits, gene_short_name, q_value, normalized_effect)
+
+dose_fits <- good_fits[order(-good_fits$normalized_effect),]
+dose_fits <- as.data.frame(dose_fits)
+rownames(dose_fits) <- dose_fits$gene_short_name
+
+rm(cds4)
+rm(DEG_coeffs)
+rm(doseDEGs)
+rm(good_fits)
+
+saveRDS(dose_fits, paste0(main_dir, "dose_fits_ErkNFAT.rds"))
+
+```
+
+Stimulation DEGs
+```{r}
+
+#Assess each pMHC condition separately against rest
+activated_genes <- c()
+repressed_genes <- c()
+
+for (i in conditions_10x[-1]) {
+  
+  print(i)
+  cell_subset <- row.names(subset(pData1, Cond %in% c("Rest", i)))
+  cds3_subset <- cds3[,cell_subset]
+  
+  colData(cds3_subset)$Cond <- factor(colData(cds3_subset)$Cond)
+  
+  stimDEGs <- fit_models(cds3_subset, model_formula_str = "~Cond")
+  DEG_coeffs <- coefficient_table(stimDEGs)
+  good_fits <- subset(DEG_coeffs, status == "OK" & term != "(Intercept)" & q_value < 0.05)
+  good_fits <- dplyr::select(good_fits, gene_short_name, q_value, normalized_effect)
+  stim_fits <- good_fits[order(-good_fits$normalized_effect),]
+  
+  act <- stim_fits$gene_short_name[which(stim_fits$normalized_effect>0)]
+  rep <- stim_fits$gene_short_name[which(stim_fits$normalized_effect<0)]
+  
+  activated_genes <- c(activated_genes, act)
+  repressed_genes <- c(repressed_genes, rep)
+  
+}
+
+activated_genes <- unique(activated_genes)
+repressed_genes <- unique(repressed_genes)
+
+rm(cds3_subset)
+rm(DEG_coeffs)
+rm(stimDEGs)
+rm(good_fits)
+
+```
+
+DEG lists not filtered on Erk and NFAT regulated genes
+```{r}
+
+cds2 <- readRDS(paste0(main_dir, "cds_full.rds"))
+pData2 <- as.data.frame(pData(cds2))
+
+#Log transform dose
+pData2$Dose <- as.numeric(levels(pData2$Dose))[pData2$Dose]
+pData2$Dose <- log10(pData2$Dose/2)
+colData(cds2)$Dose <- pData2$Dose
+pData2 <- as.data.frame(pData(cds2))
+
+pData2$stim <- 1
+pData2$stim[which(pData2$Cond == "Rest")] <- 0
+colData(cds2)$stim <- factor(pData2$stim)
+
+
+good_cells <- row.names(subset(pData2, UMI >= 500))
+expressed_genes <- row.names(subset(fData(cds2), num_cells_expressed >= 100))
+
+cds2 <- cds2[expressed_genes,good_cells]
+
+#These parameters work well with 500 UMI cutoff.
+set.seed(10)
+cds2 <- preprocess_cds(cds2, num_dim = 100)
+cds2 <- reduce_dimension(cds2, reduction_method = "UMAP", umap.min_dist = 0.05, umap.n_neighbors = 6)
+
+plot_cells(cds2, color_cells_by = "Cond") + scale_color_manual(values = scatter_colors_alternate) + facet_wrap(~Cond)
+plot_cells(cds3, color_cells_by = "Cond") + scale_color_manual(values = scatter_colors_alternate) + facet_wrap(~Cond)
+
+
+
+#Compare high dose high affinity to high dose low affinity (i.e CD69 saturation conditions)
+affinity_cells <- row.names(subset(pData2, Cond %in% conditions_10x[c(2,3,5,6)]))
+cds4 <- cds2[,affinity_cells]
+
+#DEGs across different affinity peptides
+affinityDEGs <- fit_models(cds4, model_formula_str = "~Affinity")
+
+DEG_coeffs <- coefficient_table(affinityDEGs)
+good_fits <- subset(DEG_coeffs, status == "OK" & term != "(Intercept)" & q_value < 0.05)
+good_fits <- dplyr::select(good_fits, gene_short_name, q_value, normalized_effect)
+
+aff_fits <- good_fits[order(good_fits$normalized_effect),]
+aff_fits$normalized_effect <- aff_fits$normalized_effect*-1
+
+rm(cds4)
+rm(DEG_coeffs)
+rm(affinityDEGs)
+rm(good_fits)
+
+saveRDS(aff_fits, paste0(main_dir, "aff_fits_fullgenelist.rds"))
+
+
+#Compare all doses of agonist peptide
+agonist_cells <- row.names(subset(pData2, Cond %in% conditions_10x[2:4]))
+cds4 <- cds2[,agonist_cells]
+
+#DEGs acrosss different doses of agonist peptide
+doseDEGs <- fit_models(cds4, model_formula_str = "~Dose")
+
+DEG_coeffs <- coefficient_table(doseDEGs)
+good_fits <- subset(DEG_coeffs, status == "OK" & term != "(Intercept)" & q_value < 0.05)
+good_fits <- dplyr::select(good_fits, gene_short_name, q_value, normalized_effect)
+
+dose_fits <- good_fits[order(-good_fits$normalized_effect),]
+
+rm(cds4)
+rm(DEG_coeffs)
+rm(doseDEGs)
+rm(good_fits)
+
+saveRDS(dose_fits, paste0(main_dir, "dose_fits_fullgenelist.rds"))
+
+
+
+#Compare stim vs rest
+stimDEGs <- fit_models(cds2, model_formula_str = "~stim")
+DEG_coeffs <- coefficient_table(stimDEGs)
+good_fits <- subset(DEG_coeffs, status == "OK" & term != "(Intercept)" & q_value < 0.05)
+good_fits <- dplyr::select(good_fits, gene_short_name, q_value, normalized_effect)
+
+stim_fits <- good_fits[order(-good_fits$normalized_effect),]
+
+saveRDS(stim_fits, paste0(main_dir, "stim_fits_fullgenelist.rds"))
+
+
+```
+
+Venn diagram of affinity/dose vs Erk/NFAT
+```{r}
+#All genes in scRNAseq
+doseALL <- dose_fits$gene_short_name
+affALL <- aff_fits$gene_short_name
+stimALL <- stim_fits$gene_short_name
+
+
+#subset on Erk/NFAT regulated
+dosereg <- dose_genes$gene
+affreg <- affinity_genes$gene
+
+
+venn <- venn.diagram(x = list(doseALL,Ereg,Nreg,ENreg),
+                     category.names = c("dose", "E", "N", "EN"),
+                     filename = NULL,
+                     cex = 1,
+                     cat.cex = 1,
+                     lwd = 2)
+
+
+
+#Dose
+grid.draw(venn.diagram(x = list(doseALL,B$gene),
+                     category.names = c("Dose", "Erk/NFAT"),
+                     filename = NULL,
+                     cex = 1,
+                     cat.cex = 1,
+                     lwd = 2))
+
+#Affinity
+grid.draw(venn.diagram(x = list(affALL,B$gene),
+                     category.names = c("Affinity", "Erk/NFAT"),
+                     filename = NULL,
+                     cex = 1,
+                     cat.cex = 1,
+                     lwd = 2))
+
+#Stim-dependent only
+stimONLY <- setdiff(setdiff(stimALL, affALL),doseALL)
+
+grid.draw(venn.diagram(x = list(stimONLY,B$gene),
+                     category.names = c("Stim", "Erk/NFAT"),
+                     filename = NULL,
+                     cex = 1,
+                     cat.cex = 1,
+                     lwd = 2))
+
+
+```
+
+----------------------------------------------------------------
+
+Find co-regulated genes - Fig 4D
+
+First perform LASSO regression on all gene-gene pairs to find predictor genes for each other gene (i.e correlated)
+```{r}
+#Filter out genes expressed in too few cells
+expressed_genes <- row.names(subset(fData(cds3), num_cells_expressed >= 0.05 * dim(cds3)[2]))
+cds4 <- cds3[expressed_genes,]
+
+#Get expression data - log transformed is default
+expressiondata <- as.matrix(normalized_counts(cds4))
+
+sc_barcodes <- colnames(expressiondata)
+ENS_names <- rownames(expressiondata)
+
+#Swap target id for gene short name
+rData4 <- as.data.frame(rowData(cds4))
+gene_row_names <- match(ENS_names, rData4$id)
+rownames(expressiondata) <- rData4$gene_short_name[gene_row_names]
+
+expr_mat <- t(expressiondata)
+scaled_mat <- scale(expr_mat)
+gene_list <- colnames(scaled_mat)
+
+#Run LASSO regressions
+
+#This takes a long time, recommend multiple cores using pbmclapply instead of lapply
+#Can load the results to speed up downstream analysis
+lasso_result <- readRDS("lasso_result.rds")
+
+#Code adapted from Cao et al.
+# lasso_result <- pbmclapply(gene_list, function(x) {
+#   # remove this gene from the matrix
+#   m1 <- scaled_mat[,colnames(scaled_mat) != x]
+#   selected_gene <- scaled_mat[,x]
+#   
+#   result = do_lasso(gene_matrix = m1, gene_vector = selected_gene)
+#   return(result)
+# })
+
+```
+
+Cluster LASSO results
+```{r}
+
+#Drop lasso regression coefficients into a pairwise correlation matrix
+ggc_lasso <- matrix(nrow = length(gene_list), ncol = length(gene_list))
+rownames(ggc_lasso) <- gene_list
+colnames(ggc_lasso) <- gene_list
+
+for (i in 1:length(lasso_result)) {
+  result <- lasso_result[[i]][[2]]
+  row_match <- match(result$id, rownames(ggc_lasso))
+  ggc_lasso[row_match,i] <- result$corcoef
+}
+
+#Filter genes with no predictor genes
+coeff_sums <- Matrix::colSums(abs(ggc_lasso), na.rm = T)
+top_genes <- rownames(ggc_lasso)[which(coeff_sums > 0.000)]
+
+ggc_lasso <- ggc_lasso[top_genes,top_genes]
+ggc_lasso = (ggc_lasso+t(ggc_lasso))/2   # symmetrize the matrix
+
+ggc_lasso2 <- ggc_lasso
+
+#Set diagonal values to the max
+ggc_lasso2[is.na(ggc_lasso2)] <- max(ggc_lasso2, na.rm = T)
+
+col_lasso = colorRamp2(c(-0.01, 0, 0.01), c("blue", "grey", "red"))
+
+d <- distanceMatrix(ggc_lasso2, metric = 'spearman')
+d <- hclust(d, method = "average")
+set.seed(12)
+d <- reorder(as.dendrogram(d), rowMeans(ggc_lasso, na.rm = T))
+
+draw(Heatmap(ggc_lasso2,
+        col = col_lasso,
+        cluster_columns = d, 
+        cluster_rows = d,
+        row_dend_reorder = F,
+        column_dend_reorder = F,
+        show_column_dend = TRUE,
+        column_dend_height = unit(0.5, "cm"),
+        show_column_names = F,
+        show_row_dend = FALSE,
+        row_dend_width = unit(0.5, "cm"),
+        show_row_names = F,
+        use_raster = F,
+        #left_annotation = row_ha,
+        #right_annotation = labels_ha,
+        heatmap_legend_param = list(direction = "horizontal"),
+        name = "LASSO regression coefficient"), heatmap_legend_side="bottom")
+
+
+```
+
+Define co-regulated clusters
+Start with seed genes and move up the dendrogram until too much dissimilarity is achieved.
+```{r}
+
+#Adjust the height for each cluster - indicated below are the heights used
+h_thresh <- 0.36
+
+d2 <- color_labels(d, col = ifelse(labels(d) %in% seed_genes, 2, 1)) %>% set("labels_cex", 0.5) %>% set("by_labels_branches_col", value = c(seed_genes), type = "any") %>% set("by_labels_branches_lwd", value = c(seed_genes), TF_values = c(4,Inf)) %>% set("branches_k_color", value = 3:1, h = h_thresh)
+
+plot(d2); abline(h = h_thresh, col = 1, lty = 2)
+
+
+regulons <- data.frame("regulon" = cutree(d2, h = h_thresh, order_clusters_as_data = F))
+regulons$gene <- rownames(regulons)
+
+#initialize final data frame at the beginning to store the cluster IDs
+#regulons_final <- regulons
+
+regulons_final$regulon <- NA
+
+#iterate through this block adjusting the cutoff height for each seed gene below and assigning the cluster ID
+#A bit of a tedious process... Need to automate
+
+#Il2ra - h = 0.3
+regulons_final$regulon[which(regulons$regulon == 1)] <- 1
+
+#Lag3 - h = 0.32
+regulons_final$regulon[which(regulons$regulon == 4)] <- 2
+
+#Irf4 - h = 0.37
+regulons_final$regulon[which(regulons$regulon == 8)] <- 3
+
+#Ccl3 - h = 0.34
+regulons_final$regulon[which(regulons$regulon == 19)] <- 4
+
+#Cd47 - h = 0.41
+regulons_final$regulon[which(regulons$regulon == 8)] <- 5
+
+#Stat1 - h = 0.41
+regulons_final$regulon[which(regulons$regulon == 9)] <- 6
+
+#Sell - h = 0.37
+regulons_final$regulon[which(regulons$regulon == 29)] <- 7
+
+#Klf2 - h = 0.38
+regulons_final$regulon[which(regulons$regulon == 24)] <- 8
+
+```
+
+Plot LASSO matrix
+```{r}
+
+#Initialize every label to default
+regulons_final$lab_color <- "#000000FF"
+regulons_final$edge_color <- "#00000000"
+
+#Color broad clusters from initial groupings
+for (i in 1:8) {
+  regulons_final$edge_color[regulons_final$regulon == i] <- regulon_colors[i]
+  regulons_final$lab_color[regulons_final$regulon == i] <- regulon_colors[i]
+}
+
+
+d3 <- color_branches(d, col=regulons_final[labels(d),"lab_color"])
+d3 <- color_labels(d3, col=regulons_final[labels(d),"lab_color"]) %>% set("labels_cex", 0.5)
+
+#LASSO heatmap
+col_lasso = colorRamp2(c(-0.01, 0, 0.01), c("blue", "grey", "red"))
+
+seed_genes <- c("Ccl3", "Stat1", "Klf2", "Sell", "Irf4", "Il2ra", "Lag3", "Cd47")
+GOIs2 <- c("Fosb", "Fos", "Cxcr6", "Bcl2a1d")
+GOIs2 <- c(GOIs2, "Tnf", "Prf1", "Egr1", "Egr2", "Egr3")
+GOIs2 <- c(GOIs2, "Ccl3", "Tnfrsf4", "Pdcd1", "Ccl4", "Btk")
+GOIs2 <- c(GOIs2, "Ifng", "Nr4a3", "Tead1", "Plek")
+GOIs2 <- c(GOIs2, "Il7r", "Runx2", "Il18r1", "Cd55")
+GOIs2 <- c(GOIs2, "Klf2", "Rasa3", "Ifngr2", "Ctla2b", "Gzma")
+GOIs2 <- c(GOIs2, "Gata3", "Cxcl10", "Klrd1", "Trim5")
+GOIs2 <- c(GOIs2, "Rel", "Serpinb9", "Serpinb6b")
+GOIs2 <- c(GOIs2, "Irf8", "Irf4", "Il2ra")
+GOIs2 <- c(GOIs2, "Lag3", "Tbx21")
+GOIs2 <- c(GOIs2, "Nr4a1")
+GOIs2 <- c(GOIs2, "Ccr7", "Eomes")
+GOIs2 <- c(GOIs2, "Stat1", "Tcf7")
+GOIs2 <- c(GOIs2, "Sell", "Ifngr1", "Gzmb")
+GOIs <- GOIs2
+rm(GOIs2)
+
+lasso_cluster_genes <- c(GOIs, "Cd47", "Il2rb", "Fasn", "Casp3", "Nfat5", "Myc", "Bcl2a1b", "Orai1", "Jund", "Cd3g", "Lat", "Il12rb2", "Eif4e3", "Ets1", "Ccl3", "Ccl4")
+
+genes_to_label_pos <- which(rownames(ggc_lasso) %in% lasso_cluster_genes)
+genes_to_label <- rownames(ggc_lasso[genes_to_label_pos, ])
+
+row_ha = rowAnnotation(a = anno_mark(at= genes_to_label_pos, labels = genes_to_label, which="row", side = "left", labels_gp = gpar(col= "black",fontsize = 8)))
+labels_ha <- rowAnnotation(Cluster = factor(B$lasso_clust[match(colnames(ggc_lasso), B$gene)], levels = rev(c(1:8))),
+                              col = list(Cluster = c("1" = regulon_colors[1],"2" = regulon_colors[2],"3" = regulon_colors[3],"4" = regulon_colors[4],
+                                                  "5" = regulon_colors[5], "6" = regulon_colors[6], "7" = regulon_colors[7], "8" = regulon_colors[8])),
+                              simple_anno_size = unit(2, "mm"),show_annotation_name = FALSE, show_legend = F)
+
+setwd("/Users/matthewjwither/Desktop")
+pdf(file = "LASSO_matrix.pdf", width = 4, height = 4)
+draw(Heatmap(ggc_lasso2,
+        col = col_lasso,
+        cluster_columns = d3, 
+        cluster_rows = d3,
+        row_dend_reorder = F,
+        column_dend_reorder = F,
+        show_column_dend = TRUE,
+        column_dend_height = unit(0.5, "cm"),
+        show_column_names = F,
+        show_row_dend = FALSE,
+        row_dend_width = unit(0.5, "cm"),
+        show_row_names = F,
+        use_raster = F,
+        left_annotation = row_ha,
+        #right_annotation = labels_ha,
+        heatmap_legend_param = list(direction = "horizontal"),
+        name = "LASSO regression coefficient"), heatmap_legend_side="bottom")
+ dev.off()
+
+
+# htShiny(Heatmap(ggc_lasso,
+#         col = col_lasso,
+#         cluster_columns = rev(d3), 
+#         cluster_rows = rev(d3),
+#         row_dend_reorder = F,
+#         column_dend_reorder = F,
+#         show_column_dend = TRUE,
+#         column_dend_height = unit(0.5, "cm"),
+#         show_column_names = F,
+#         show_row_dend = FALSE,
+#         row_dend_width = unit(0.5, "cm"),
+#         show_row_names = F,
+#         use_raster = F,
+#         #left_annotation = row_ha,
+#         right_annotation = labels_ha,
+#         heatmap_legend_param = list(direction = "horizontal"),
+#         name = "LASSO coefficient"))
+
+
+#Save regulon data frame
+#saveRDS(regulons_final, "regulons_final.rds")
+
+```
+
+----------------------------------------------------------------
+
+Merge data with linear model B coeffs
+```{r}
+
+#Load beta coeff table
+B <- readRDS("Bdata.rds")
+
+B <- B[,c("gene", "NFATn", "Erkn", "ErkNFATn", "reg_cluster", "label")]
+
+B[,c("Aff_norm_effect", "Dose_norm_effect")] <- NA
+B$Dose_norm_effect[match(dose_fits$gene_short_name, B$gene)] <- dose_fits$normalized_effect
+B$Aff_norm_effect[match(aff_fits$gene_short_name, B$gene)] <- aff_fits$normalized_effect
+
+
+B$lasso_clust <- NA
+lasso_B_match <- match(regulons_final$gene, B$gene)
+B$lasso_clust[lasso_B_match] <- regulons_final$regulon
+B$lasso_clust <- factor(B$lasso_clust, levels = c(1:8))
+
+
+#saveRDS(B,"Bdata.rds")
+
+```
+
+Correlation betas with gene module expression
+```{r}
+
+col_B = colorRamp2(c(-0.5, 0, 0.5), c(brewer.pal(7, "BrBG")[7], "white", brewer.pal(7, "BrBG")[1]))
+col_pseudo = colorRamp2(c(-2, 0, 2), c(brewer.pal(7, "BrBG")[7], "white", brewer.pal(7, "BrBG")[1]))
+
+
+regulon_df <- subset(regulons_final, !is.na(regulon))
+regulon_df <- regulon_df[order(regulon_df$regulon),]
+regulon_df <- regulon_df[,c("gene", "regulon")]
+split <- as.data.frame(regulon_df$regulon)
+rownames(split) <- rownames(regulon_df)
+colnames(split) <- "split"
+split$split <- factor(split$split, levels = c(8:1))
+regulon_genes <- regulon_df$gene
+
+clust_labels <- rowAnnotation(Cluster = factor(regulon_df$regulon, levels = c(1:8)),
+                              col = list(Cluster = c("1" = regulon_colors[1],
+                                                  "2" = regulon_colors[2],
+                                                  "3" = regulon_colors[3],
+                                                  "4" = regulon_colors[4],
+                                                  "5" = regulon_colors[5],
+                                                  "6" = regulon_colors[6],
+                                                  "7" = regulon_colors[7],
+                                                  "8" = regulon_colors[8])),
+                              simple_anno_size = unit(2, "mm"),
+                              show_annotation_name = FALSE, show_legend = F)
+
+
+
+#Pseudobulk data
+gene_ids <- match(top_genes, rData1$gene_short_name)
+
+cds4 <- cds3[rData1$id[gene_ids],]
+regulon_aggregate <- aggregate_gene_expression(cds4, cell_group_df = pData1[,c("barcode", "Cond")], norm_method = "log", scale_agg_values = F)
+
+#Swap target id for gene short name
+id2g <- as.data.frame(rowData(cds4))
+old_row_names <- rownames(regulon_aggregate)
+new_row_names <- match(old_row_names, id2g$id)
+rownames(regulon_aggregate) <- id2g$gene_short_name[new_row_names]
+
+#Re-order columns
+regulon_aggregate <- as.matrix(regulon_aggregate[,c("Rest", "20pmolPA", "80pmolPA", "02pmolA", "2pmolA", "20pmolA")])
+regulon_aggregate <- t(scale(t(regulon_aggregate), scale = T, center = T))
+
+agg_mat <- regulon_aggregate[regulon_genes,]
+
+#B coeffs
+Blasso <- subset(B, !is.na(lasso_clust))
+Blasso$lasso_clust <- factor(Blasso$lasso_clust, levels = c(1:8))
+Blasso <- Blasso[regulon_genes,]
+
+Bmatrix <- as.matrix(Blasso[regulon_genes,c("NFATn", "Erkn", "ErkNFATn")])
+
+#Row annotation
+genes_to_label_pos <- which(rownames(agg_mat) %in% lasso_cluster_genes)
+genes_to_label <- rownames(agg_mat[genes_to_label_pos, ])
+row_ha = rowAnnotation(a = anno_mark(at= genes_to_label_pos, labels = genes_to_label, which="row", side = "right", labels_gp = gpar(col= "black", fontsize = 8)))
+
+
+#Fig 4E heatmaps with annotations
+setwd("/Users/matthewjwither/Desktop")
+
+multi_anno <- rowAnnotation(A = anno_barplot(Blasso$Aff_norm_effect, width = unit(1, "cm")),
+  D = anno_barplot(Blasso$Dose_norm_effect, width = unit(1, "cm")),
+  annotation_name_rot = 90, gap = unit(2, "mm"))
+
+#Row annotation
+genes_to_label_pos <- which(rownames(agg_mat) %in% lasso_cluster_genes)
+genes_to_label <- rownames(agg_mat[genes_to_label_pos, ])
+left_labels = rowAnnotation(a = anno_mark(at= genes_to_label_pos, labels = genes_to_label, which="row", side = "left", labels_gp = gpar(col= "black", fontsize = 8, fontface = "italic")))
+
+ht_list <- Heatmap(agg_mat,
+        col = col_pseudo,
+        show_row_dend = F,
+        row_dend_width = unit(100, "mm"),
+        show_column_dend = F,
+        show_column_names = F,
+        show_row_names = F,
+        row_names_gp = gpar(fontsize = 6),
+        row_names_side = "right",
+        cluster_columns = F,
+        cluster_rows = T,
+        row_split = split,
+        cluster_row_slices = F,
+        row_gap = unit(4, "mm"),
+        border = T,
+        left_annotation = left_labels,
+        row_title = NULL,
+        show_heatmap_legend = FALSE,
+        name = "Expr") +
+  Heatmap(Bmatrix,
+        col = col_B,
+        show_row_dend = F,
+        row_dend_width = unit(100, "mm"),
+        show_column_dend = F,
+        show_column_names = F,
+        show_row_names = F,
+        row_names_gp = gpar(fontsize = 6),
+        row_names_side = "right",
+        cluster_columns = F,
+        cluster_rows = T,
+        row_split = split,
+        cluster_row_slices = F,
+        row_gap = unit(4, "mm"),
+        border = T,
+        left_annotation = multi_anno,
+        row_title = NULL,
+        show_heatmap_legend = FALSE,
+        name = "B coeffs")
+
+
+pdf(file = "Fig4E.pdf", width = 3, height = 7)
+
+draw(ht_list, main_heatmap = "B coeffs")
+
+for (slice in 1:8) {
+  decorate_annotation("D", {grid.lines(unit(c(0, 0), "native"), c(0, 1), gp = gpar(lty = 1, size = 0.5, col = "red"))}, slice = slice )
+  decorate_annotation("A", {grid.lines(unit(c(0, 0), "native"), c(0, 1), gp = gpar(lty = 1, size = 0.5, col = "red"))}, slice = slice )
+}
+
+dev.off()
+
+
+```
+
+----------------------------------------------------------------
+
+Regulatory mode composition of each LASSO cluster
+```{r}
+
+Blasso <- subset(B, !is.na(lasso_clust))
+
+#Split by cluster
+lasso_clust_split <- split(Blasso, Blasso$lasso_clust)
+
+#output list
+fractional_comp_by_cluster <- list()
+
+for (i in names(lasso_clust_split)) {
+  df <- lasso_clust_split[[i]]
+  total_genes <- length(df$gene)
+  
+  df.split <- split(df, df$reg_cluster)
+  
+  frac_comp <- data.frame("reg_clust" = names(df.split), "frac" = NA, "lasso_clust" = i)
+  
+  for (j in 1:length(names(df.split))) {
+    temp <- df.split[[j]]
+    
+    no_genes <- length(temp$gene)
+    frac_comp$frac[j] <- no_genes/total_genes
+
+  }
+  
+  fractional_comp_by_cluster[[i]] <- frac_comp
+  rm(df.split)
+  rm(df)
+  rm(temp)
+}
+
+fractional_compositions <- bind_rows(fractional_comp_by_cluster)
+fractional_compositions$lasso_clust <- factor(fractional_compositions$lasso_clust)
+
+brBG <- rev(brewer.pal(8, "BrBG"))
+reg_clust_colors <- c(brBG[1], brBG[1], brBG[2], brBG[3], brBG[3], brBG[4], brBG[4], brBG[5], brBG[6], brBG[6], brBG[7], brBG[7], brBG[8], brBG[8])
+
+
+```
+
+Fisher's Exact Test for gene enrichment from regulatory clusters
+```{r}
+#https://www.pathwaycommons.org/guide/primers/statistics/fishers_exact_test/
+
+#Output df
+module_probs <- list()
+
+total_genes <- length(B$gene)
+
+for (mod in levels(Blasso$lasso_clust)) {
+  probs <- data.frame()
+  
+  for(clust in levels(B$reg_cluster)) {
+    
+    genes_in_module <- subset(Blasso, lasso_clust == mod)
+    genes_in_regcluster <- subset(B, reg_cluster == clust)
+    
+    # Initialize variables
+    m <- length(genes_in_regcluster$gene)    # Genes IN NFAT/Erk regulatory cluster
+    n <- total_genes - m                  # Genes NOT IN NFAT/Erk regulatory cluster
+    k <- length(genes_in_module$gene)   # Genes in a specific co-expressed gene module
+    x <- c(0:k)                         # Genes both IN regulatory cluster and IN gene module
+    
+    # Use the dhyper built-in function for hypergeometric density 
+    probabilities <- dhyper(x, m, n, k, log = FALSE)
+    
+    probs[clust,1:length(probabilities)] <- probabilities
+    
+  }
+  
+  probs <- as.data.frame(t(probs))
+  probs$x <- x
+  
+  probs <- pivot_longer(probs, cols = 1:length(levels(B$reg_cluster)), names_to = "reg_cluster", values_to = "Prob")
+  probs$reg_cluster <- factor(probs$reg_cluster)
+  
+  module_probs[[mod]] <- probs
+  
+}
+
+#Example plots
+ggplot(module_probs[[1]], aes(x= x, y= Prob)) +
+  geom_bar(stat="identity") +
+  labs(x = "Module genes IN Reg Cluster", y = "Probability") +
+  facet_wrap(~reg_cluster, scales = "free")
+
+
+```
+
+Calc enrichment p values - Fig 4G
+```{r}
+
+module_cluster_enrich <- list()
+
+for (mod in names(module_probs)) {
+  
+  genes_in_module <- subset(Blasso, lasso_clust == mod)
+  probs <- module_probs[[mod]]
+  
+  sig_test <- data.frame("module" = rep(mod, length(levels(probs$reg_cluster))), "reg_cluster" = levels(probs$reg_cluster), "pval" = NA)
+  rownames(sig_test) <- levels(probs$reg_cluster)
+  
+  for(clust in levels(probs$reg_cluster)) {
+    
+    genes_in_regcluster <- subset(B, reg_cluster == clust)
+    
+    #Genes both IN regulatory cluster and IN gene module
+    genes_in_both <- intersect(genes_in_module$gene, genes_in_regcluster$gene)
+    xIN <- length(genes_in_both)
+    
+    probs2 <- subset(probs, reg_cluster == clust & x >= xIN)
+    pval <- sum(probs2$Prob)
+    
+    sig_test[clust,"pval"] <- pval
+    
+  }
+  
+  module_cluster_enrich[[mod]] <- sig_test
+  
+}
+
+module_cluster_enrich <- bind_rows(module_cluster_enrich)
+module_cluster_enrich$logP <- round((log10(module_cluster_enrich$pval)*-1),6)
+top3 <- split(module_cluster_enrich, module_cluster_enrich$module)
+for(clust in names(top3)) {
+  mod <- top3[[clust]]
+  mod <- mod[order(mod$logP, decreasing = T),]
+  top3[[clust]] <- mod[1:3,]
+}
+top3 <- bind_rows(top3)
+
+
+ggplot(top3, aes(x = as.factor(module), y = logP, fill = reg_cluster)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.5, show.legend = F) +
+  labs(y = "-log(p)", x = "co-expression cluster") +
+  geom_hline(aes(yintercept = -1*log10(0.05)), linetype = "dashed") +
+  scale_fill_manual(values = c("A1" = "blue", "A1w" = "blue", "A2" = "blue", "A3" = "red", "A3w" = "red", 
+                                   "A4w" = "red", "R1w" = "blue", "R2w" = "red", "R3w" = "red", "R2" = "red", 
+                                   "R3" = "red")) +
+  coord_flip() +
+  geom_text(aes(label = reg_cluster, y = 0.2), position = position_dodge(.9), hjust = 0) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+
+#Plot as heatmap instead with all regulatory modes per cluster
+enrichment <- module_cluster_enrich[,c(1,2,4)]
+enrichment <- as.data.frame(pivot_wider(enrichment, names_from = reg_cluster, values_from = logP))
+rownames(enrichment) <- 1:8
+enrichment <- enrichment[8:1,-1]
+
+enrichment_strong <- enrichment[,!endsWith(colnames(enrichment), "w")]
+enrichment_weak <- enrichment[,endsWith(colnames(enrichment), "w")]
+
+col_enrich = colorRamp2(c(0, 7), c("white", "red"))
+
+#Plot along with B summary stats heat maps generated below
+setwd("/Users/matthewjwither/Desktop")
+pdf(file = "Fig5pvalMatrix.pdf", width = 12, height = 3)
+Heatmap(Bsummary_scaled[8:1,],
+          col = col_Bsummary,
+          cluster_rows = F, cluster_columns = F,
+          row_names_side = "left",
+          column_names_side = "top",
+          column_names_rot = 45,
+          cell_fun = function(j, i, x, y, width, height, fill) {
+            if (one_sample_pval_ttest[8:1,][i, j] < 1) 
+              grid.text(signif(one_sample_pval_ttest[8:1,][i, j],1), x, y, gp = gpar(fontsize = 8), rot = 0)
+          },
+          name = "Scaled") +
+
+Heatmap(as.matrix(enrichment_strong),
+        col = col_enrich,
+        cluster_rows = F,
+        cluster_columns = F,
+        row_names_side = "left",
+        column_names_side = "top",
+        cell_fun = function(j, i, x, y, width, height, fill) {
+            if (enrichment_strong[i, j] > -log10(0.05))
+              grid.text(signif(enrichment_strong[i, j],2), x, y, gp = gpar(fontsize = 8), rot = 0)},
+        show_heatmap_legend = F) +
+  
+  Heatmap(as.matrix(enrichment_weak),
+          col = col_enrich,
+        cluster_rows = F,
+        cluster_columns = F,
+        row_names_side = "left",
+        column_names_side = "top",
+        cell_fun = function(j, i, x, y, width, height, fill) {
+            if (enrichment_weak[i, j] > -log10(0.05))
+              grid.text(signif(enrichment_weak[i, j],2), x, y, gp = gpar(fontsize = 8), rot = 0)},
+          name = "-logP")
+
+dev.off()
+
+```
+
+Heatmap of beta summary stats by gene module - Fig 4F
+```{r}
+
+Blasso2 <- Blasso[,c("NFATn", "Erkn", "ErkNFATn", "lasso_clust")]
+
+summary_stats <- c("mNFAT", "mErk", "mErkNFAT", "vNFAT", "vErk", "vErkNFAT", "covNvE", "covNvEN", "covEvEN", "corNvE", "corNvEN", "corEvEN")
+
+Bsummary <- data.frame(lasso_clust = 1:8)
+Bsummary_pvals <- Bsummary
+
+
+
+for (i in 1:8) {
+  
+  #Mean betas
+  temp_means <- colMeans(subset(Blasso2, lasso_clust == i)[,c(1:3)])
+  
+  #Covariances and variances
+  temp_cov <- cov(subset(Blasso2, lasso_clust == i)[,1:3])
+  temp_var <- diag(temp_cov)
+  
+  temp_cov <- temp_cov[lower.tri(temp_cov)]
+  
+  #Pearson correlation (i.e covariance normalized by variance)
+  temp_correlation <- cor(subset(Blasso2, lasso_clust == i)[,1:3])
+  temp_correlation <- temp_correlation[lower.tri(temp_correlation)]
+  
+  Bsummary[i,summary_stats] <- c(temp_means, temp_var, temp_cov, temp_correlation)
+  
+  
+}
+
+Bsummary$lasso_clust <- NULL
+
+#Get column maximums to scale by
+colMax <- function(x) sapply(x, max, na.rm = TRUE)
+
+Bsummary_scaled <- scale(Bsummary, center = F, scale = colMax(Bsummary))
+
+rownames(Bsummary_scaled) <- 1:8
+
+#Test if mean betas for each gene module's set of genes are greater or less than 0
+one_sample_pval_ttest <- Bsummary
+for (i in 1:8) {
+  for (j in 1:3) {
+    
+    test_distribution <- subset(Blasso2, lasso_clust == i)
+    less <- t.test(test_distribution[,j], mu = 0, alternative = "less")
+    greater <- t.test(test_distribution[,j], mu = 0, alternative = "greater")
+    
+    if (greater$p.value < 0.05) {
+      one_sample_pval_ttest[i,j] <- greater$p.value
+    } else if (less$p.value < 0.05) {
+      one_sample_pval_ttest[i,j] <- less$p.value
+    } else {
+      one_sample_pval_ttest[i,j] <- 1
+    }
+    
+  }
+}
+
+#Set the unused p values to 1 to avoid annotating them on the heatmap
+one_sample_pval_ttest[,-c(1:3)] <- 1
+
+
+col_Bsummary = colorRamp2(c(-1, 0, 1), c("blue", "white", "red"))
+col_Bsummary2 = colorRamp2(c(-5, 0, 1), c("blue", "white", "red"))
+
+setwd("/Users/matthewjwither/Desktop")
+pdf(file = "Fig4_FandG.pdf", width = 6, height = 3)
+Heatmap(Bsummary_scaled[8:1,1:6],
+          col = col_Bsummary,
+          cluster_rows = F, cluster_columns = F,
+          column_title = NULL,
+          column_split = rep(1:2, each = 3),
+          row_names_side = "left",
+          cell_fun = function(j, i, x, y, width, height, fill) {
+            if (one_sample_pval_ttest[8:1,][i, j] < 1) 
+              grid.text(signif(one_sample_pval_ttest[8:1,][i, j],1), x, y, gp = gpar(fontsize = 8), rot = 0)
+          },
+          name = "Scaled") +
+  
+  Heatmap(Bsummary_scaled[8:1,7:12],
+          col = col_Bsummary2,
+          cluster_rows = F, cluster_columns = F,
+          column_title = NULL,
+          column_split = rep(1:2, each = 3),
+          row_names_side = "left",
+          name = "Scaled2")
+dev.off()
+
+```
+
+----------------------------------------------------------------
+
+Affinity and dose effects by gene module - Fig S4E
+```{r}
+
+#Wilcoxon test to determine if each gene module is dependent on dose/affinity
+
+#Dose and affinity effects
+wil_tests <- list()
+for (i in levels(Blasso$lasso_clust)) {
+
+  df <- subset(Blasso, lasso_clust == i)
+  
+  if (!all(is.na(df$Aff_norm_effect))) {
+    test_aff <- wilcox.test(df$Aff_norm_effect, paired = F)
+  } else {
+    test_aff <- wilcox.test(c(NA, NA, 0.001), paired = F) #Gives p-value = 1
+  }
+  
+  if (!all(is.na(df$Dose_norm_effect))) {
+    test_dose <- wilcox.test(df$Dose_norm_effect, paired = F)
+  } else {
+    test_dose <- wilcox.test(c(NA, NA, 0.001), paired = F) #Gives p-value = 1
+  }
+  
+  out.df <- data.frame(effect = c("Aff", "Dose"), 
+                       pval = c(round(test_aff$p.value, 9), round(test_dose$p.value,9)), cluster = i)
+  
+  wil_tests[[i]] <- out.df
+  
+}
+
+wil_tests <- bind_rows(wil_tests)
+wil_tests$logP <- round( (log10(wil_tests$pval)*-1), 4)
+
+
+#plot
+ggplot(wil_tests, aes(x = as.factor(cluster), y = logP, fill = effect)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.5, show.legend = T) +
+  labs(y = "-log(p)", x = "co-expression cluster") +
+  geom_hline(aes(yintercept = -1*log10(0.05)), linetype = "dashed") +
+  scale_fill_manual(values = c("Aff" = "grey", "Dose" = "#c51b8a")) +
+  coord_flip() +
+  #geom_text(aes(label = effect, y = 0.2), position = position_dodge(.9), hjust = 0) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+```
+
+Export Beta coeff scatter plots by cluster - Fig S4F
+```{r}
+#Export scatter plots of B coefficients
+scatter_by_cluster4 <- function(df, clust, ellipse.conf.level = 0.67, ellipse.color = "grey", basename, fontsize = 12, point_size = 2, out_dir) {
+  
+  setwd(out_dir)
+  
+  clust_name <- clust
+  
+  df2 <- subset(df, lasso_clust == clust_name)[,c("NFATn", "Erkn", "ErkNFATn")]
+  df2corr <- cor(df2)
+  
+  df2means <- data.frame(Erkn = mean( df2$Erkn[which(df2$Erkn <= 0.7)] ),
+                         NFATn = mean( df2$NFATn[which(df2$NFATn <= 1 & df2$NFATn >= -0.5)] ),
+                         ErkNFATn = mean( df2$ErkNFATn[which(df2$ErkNFATn <= 0.4 & df2$ErkNFATn >= -0.4)] ))
+  
+  if (clust_name %in% 3:4) {
+    #lower right placement
+    grob1 <- grobTree(textGrob(paste0("Corr = ", as.character(round(df2corr["NFATn", "Erkn"],2))),
+                               x=0.5,  y=0.1, hjust=0, gp=gpar(col="black", fontsize=fontsize*.85)))
+    
+    grob2 <- grobTree(textGrob(paste0("Corr = ", as.character(round(df2corr["NFATn", "ErkNFATn"],2))),
+                               x=0.5,  y=0.1, hjust=0, gp=gpar(col="black", fontsize=fontsize*.85)))
+    
+    grob3 <- grobTree(textGrob(paste0("Corr = ", as.character(round(df2corr["Erkn", "ErkNFATn"],2))),
+                               x=0.5,  y=0.1, hjust=0, gp=gpar(col="black", fontsize=fontsize*.85)))
+    
+  } else {
+    #upper right placement
+    grob1 <- grobTree(textGrob(paste0("Corr = ", as.character(round(df2corr["NFATn", "Erkn"],2))),
+                               x=0.5,  y=0.9, hjust=0, gp=gpar(col="black", fontsize=fontsize*.85)))
+    
+    grob2 <- grobTree(textGrob(paste0("Corr = ", as.character(round(df2corr["NFATn", "ErkNFATn"],2))),
+                               x=0.5,  y=0.9, hjust=0, gp=gpar(col="black", fontsize=fontsize*.85)))
+    
+    grob3 <- grobTree(textGrob(paste0("Corr = ", as.character(round(df2corr["Erkn", "ErkNFATn"],2))),
+                               x=0.5,  y=0.9, hjust=0, gp=gpar(col="black", fontsize=fontsize*.85)))
+  }
+  
+  
+
+
+  plot1 <- ggplot(data = subset(df, lasso_clust == clust_name), aes(y = Erkn, x = NFATn)) +
+    geom_point(data = subset(df, lasso_clust != clust_name), color = "grey60", size = 2, alpha = 0.6) +
+    geom_point(color = "red", size = point_size, alpha = 1) +
+    geom_point(data = df2means, color = "black", size = 5, shape = 10) +
+    geom_vline(aes(xintercept = 0), linetype = "dashed") +
+    geom_hline(aes(yintercept = 0), linetype = "dashed") +
+    ylim(c(NA, 0.7)) +
+    #geom_smooth(method = "lm", se = TRUE, color = "black", size = 0.8) +
+    #stat_ellipse(type = "norm", level = ellipse.conf.level, fill = ellipse.color, geom = "polygon", alpha = 0.3) +
+    stat_hdr(method = "mvnorm", probs = c(ellipse.conf.level), show.legend = F) +
+    annotate("segment", x = 0, xend = df2means$NFATn, y = df2means$Erkn, yend = df2means$Erkn, colour = "black", linetype="dotted") +
+    annotate("segment", x = df2means$NFATn, xend = df2means$NFATn, y = 0, yend = df2means$Erkn, colour = "black", linetype="dotted") +
+    #annotation_custom(grob1) +
+    #geom_text_repel(aes(label = ifelse(lasso_clust == clust_name,as.character(label),'')), color = "black", size = 8, max.overlaps = Inf, min.segment.length = unit(0.2, 'lines')) +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.title = element_blank(),
+          #axis.text.y = element_text(size = fontsize, face = "bold"), axis.text.x = element_text(size = fontsize, face = "bold"))
+          axis.text.x = element_blank(), axis.text.y = element_blank())
+  
+  
+  pdf(file = paste0(basename, "_EvN_", as.character(clust), ".pdf"), width = 4, height = 4)
+  print(plot1)
+  dev.off()
+  
+  plot2 <- ggplot(data = subset(df, lasso_clust == clust_name), aes(y = ErkNFATn, x = NFATn)) +
+    geom_point(data = subset(df, lasso_clust != clust_name), color = "grey60", size = 2, alpha = 0.6) +
+    geom_point(color = "red", size = point_size, alpha = 1) +
+    geom_point(data = df2means, color = "black", shape = 10, size = 5) +
+    geom_vline(aes(xintercept = 0), linetype = "dashed") +
+    geom_hline(aes(yintercept = 0), linetype = "dashed") +
+    #geom_smooth(method = "lm", se = TRUE, color = "black", size = 0.8) +
+    #stat_ellipse(type = "norm", level = ellipse.conf.level, fill = ellipse.color, geom = "polygon", alpha = 0.3) +
+    stat_hdr(method = "mvnorm", probs = c(ellipse.conf.level), show.legend = F) +
+    annotate("segment", x = 0, xend = df2means$NFATn, y = df2means$ErkNFATn, yend = df2means$ErkNFATn, colour = "black", linetype="dotted") +
+    annotate("segment", x = df2means$NFATn, xend = df2means$NFATn, y = 0, yend = df2means$ErkNFATn, colour = "black", linetype="dotted") +
+    #annotation_custom(grob2) +
+    #geom_text_repel(aes(label = ifelse(lasso_clust == clust_name,as.character(label),'')), color = "black", size = 8, max.overlaps = Inf, min.segment.length = unit(0.2, 'lines')) +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.title = element_blank(),
+          #axis.text.y = element_text(size = fontsize, face = "bold"), axis.text.x = element_text(size = fontsize, face = "bold"))
+          axis.text.x = element_blank(), axis.text.y = element_blank())
+  
+  pdf(file = paste0(basename, "_ENvN_", as.character(clust), ".pdf"), width = 4, height = 4)
+  print(plot2)
+  dev.off()
+  
+  plot3 <- ggplot(data = subset(df, lasso_clust == clust_name), aes(y = ErkNFATn , x = Erkn)) +
+    geom_point(data = subset(df, lasso_clust != clust_name), color = "grey60", size = 2, alpha = 0.6) +
+    geom_point(color = "red", size = point_size, alpha = 1) +
+    geom_point(data = df2means, color = "black", shape = 10, size = 5) +
+    geom_vline(aes(xintercept = 0), linetype = "dashed") +
+    geom_hline(aes(yintercept = 0), linetype = "dashed") +
+    xlim(c(NA, 0.7)) +
+    #geom_smooth(method = "lm", se = TRUE, color = "black", size = 0.8) +
+    #stat_ellipse(type = "norm", level = ellipse.conf.level, fill = ellipse.color, geom = "polygon", alpha = 0.3) +
+    stat_hdr(method = "mvnorm", probs = c(ellipse.conf.level), show.legend = F) +
+    annotate("segment", x = 0, xend = df2means$Erkn, y = df2means$ErkNFATn, yend = df2means$ErkNFATn, colour = "black", linetype="dotted") +
+    annotate("segment", x = df2means$Erkn, xend = df2means$Erkn, y = 0, yend = df2means$ErkNFATn, colour = "black", linetype="dotted") +
+    #annotation_custom(grob3) +
+    #geom_text_repel(aes(label = ifelse(lasso_clust == clust_name,as.character(label),'')), color = "black", size = 8, max.overlaps = Inf, min.segment.length = unit(0.2, 'lines')) +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.title = element_blank(),
+          #axis.text.y = element_text(size = fontsize, face = "bold"), axis.text.x = element_text(size = fontsize, face = "bold"))
+          axis.text.x = element_blank(), axis.text.y = element_blank())
+  
+  pdf(file = paste0(basename, "_EvEN_", as.character(clust), ".pdf"), width = 4, height = 4)
+  print(plot3)
+  dev.off()
+  
+}
+
+out_dir <- "/Users/matthewjwither/Desktop/Fig4scatterplots"
+for (i in 1:8){
+  scatter_by_cluster4(df = Blasso, clust = i, ellipse.conf.level = 0.67, basename = "Fig4", out_dir = out_dir, fontsize = 22, point_size = 4)
+}
+
+```
+
+Heatmaps of dose vs affinity dependent genes - Fig S4B-C
+```{r}
+#pseudobulk by condition
+ 
+pseudobulk <- aggregate_gene_expression(cds3, cell_group_df = pData1[,c("barcode", "Cond")], norm_method = "log", scale_agg_values = T)
+
+#Re-order columns for conditions
+pseudobulk <- pseudobulk[,c("Rest", "20pmolPA", "80pmolPA", "02pmolA", "2pmolA", "20pmolA")]
+
+#Swap target id for gene short name
+id2g <- as.data.frame(rowData(cds3))
+old_row_names <- rownames(pseudobulk)
+new_row_names <- match(old_row_names, id2g$id)
+rownames(pseudobulk) <- id2g$gene_short_name[new_row_names]
+
+col_BrGn = colorRamp2(c(-2, 0, 2), c(brewer.pal(7, "BrBG")[7], "white", brewer.pal(7, "BrBG")[1]))
+
+dose_genes <- subset(B, !is.na(Dose_norm_effect))
+affinity_genes <- subset(B, !is.na(Aff_norm_effect))
+
+top_affinity_genes <- affinity_genes %>% filter(is.na(Dose_norm_effect)) %>% top_n(50, abs(Aff_norm_effect))
+
+#82 genes
+setwd("/Users/matthewjwither/Desktop")
+pdf(file = "Dose_DEGs_heatmap.pdf", width = 2.5, height = 7)
+Heatmap(pseudobulk[dose_genes$gene,],
+        #col = col_BrGn,
+        col = viridis_pal(option = "A")(24),
+        show_row_dend = F,
+        show_column_dend = F,
+        show_column_names = TRUE,
+        show_row_names = T,
+        row_names_gp = gpar(fontsize = 6),
+        row_names_side = "right",
+        cluster_columns = F,
+        cluster_rows = T,
+        name = "Scaled Expr")
+dev.off()
+
+
+genes_to_label_pos <- which(rownames(pseudobulk[affinity_genes$gene,]) %in% top_affinity_genes$gene)
+genes_to_label <- rownames(pseudobulk[affinity_genes$gene,][genes_to_label_pos, ])
+right_labels = rowAnnotation(a = anno_mark(at= genes_to_label_pos, labels = genes_to_label, which="row", side = "right", labels_gp = gpar(col= "black", fontsize = 7, fontface = "italic")))
+
+
+#591 genes
+pdf(file = "Affinity_DEGs_heatmap.pdf", width = 3, height = 7.5)
+Heatmap(pseudobulk[affinity_genes$gene,],
+        #col = col_BrGn,
+        col = viridis_pal(option = "A")(24),
+        show_row_dend = F,
+        show_column_dend = F,
+        show_column_names = TRUE,
+        show_row_names = F,
+        row_names_gp = gpar(fontsize = 6),
+        row_names_side = "right",
+        cluster_columns = F,
+        cluster_rows = T,
+        row_title = NULL,
+        right_annotation = right_labels,
+        name = "Scaled Expr")
+dev.off()
+
+
+```
+
+Find marker genes for each cluster from UMAP - Fig S4A
+```{r}
+markers <- top_markers(cds3, group_cells_by="new_cluster", marker_sig_test = T)
+
+marker_genes_to_show <- c("Klf2", "Cd47", "Stat1", "Il2ra", "Casp3", "Irf4", "Ccl3", "Pdcd1")
+marker_genes_to_show <- c("Irf4", "Il2ra", "Tcf7", "Sell", "Klf2", "Ccl4", "Ccl3", "Pdcd1", "Lag3", "Ctla4", "Cd47", "Il2rb")
+
+plot_cells(cds3, genes = marker_genes_to_show,
+             show_trajectory_graph = F, label_cell_groups = F, scale_to_range = F, norm_method = "log",
+           cell_size = 0.3, alpha = 0.5, rasterize = T) + scale_color_viridis(option = "C", direction = 1, name = "Expr", limits = c(-0.1,1.5))
+
+#Export marker gene lists as csv
+write.csv(markers, "/Users/matthewjwither/Desktop/cluster_marker_genes.csv")
+
+top_specific_markers <- markers %>%
+                            filter(fraction_expressing >= 0.1) %>%
+                            group_by(cell_group) %>%
+                            top_n(5, pseudo_R2)
+
+top_specific_marker_ids <- unique(top_specific_markers %>% pull(gene_id))
+
+plot_genes_by_group(cds3,
+                    top_specific_marker_ids,
+                    group_cells_by="new_cluster",
+                    #ordering_type="maximal_on_diag",
+                    #ordering_type="none",
+                    max.size=4,
+                    scale_max = 2,
+                    scale_min = -2,
+                    pseudocount = 1) +
+  scale_color_viridis(option = "C", direction = 1, limits = c(-0.1,1))
+
+#pseudobulk by cluster
+pseudobulk <- aggregate_gene_expression(cds3, cell_group_df = pData1[,c("barcode", "new_cluster")], norm_method = "log", scale_agg_values = T)
+
+#Swap target id for gene short name
+id2g <- as.data.frame(rowData(cds3))
+old_row_names <- rownames(pseudobulk)
+new_row_names <- match(old_row_names, id2g$id)
+rownames(pseudobulk) <- id2g$gene_short_name[new_row_names]
+
+markers_ordered <- markers[order(markers$cell_group),]
+pseudobulk2 <- pseudobulk[markers_ordered$gene_short_name,]
+rownames(pseudobulk2) <- paste(markers_ordered$gene_short_name, markers_ordered$cell_group, sep = "_")
+
+top_specific_markers$uniqueID <- paste(top_specific_markers$gene_short_name, top_specific_markers$cell_group, sep = "_")
+
+#Add genes that are unique to a single cluster
+unique_markers <- as.character(subset(as.data.frame(table(markers$gene_short_name)), Freq == 1)$Var1)
+
+additional_markers <- subset(markers, gene_short_name %in% setdiff(unique_markers, top_specific_markers$gene_short_name) & pseudo_R2 >= 0.05)
+additional_markers$uniqueID <- paste(additional_markers$gene_short_name, additional_markers$cell_group, sep = "_")
+
+#Row annotation
+genes_to_label_pos <- which(rownames(pseudobulk2) %in% c(top_specific_markers$uniqueID, additional_markers$uniqueID))
+genes_to_label <- rownames(pseudobulk2[genes_to_label_pos, ])
+genes_to_label <- gsub("_\\d", '', genes_to_label)
+
+label_colors <- as.data.frame(table(c(top_specific_markers$cell_group, additional_markers$cell_group)))
+label_colors2 <- rep(rep(c("black", "grey60"), 4), label_colors$Freq)
+
+right_labels = rowAnnotation(a = anno_mark(at= genes_to_label_pos, labels = genes_to_label, which="row", side = "right", labels_gp = gpar(col= "black", fontsize = 7, fontface = "italic")))
+
+#Plot marker genes as heatmap
+setwd("/Users/matthewjwither/Desktop")
+pdf(file = "Cluster_marker_genes_heatmap.pdf", width = 3, height = 7)
+Heatmap(pseudobulk2,
+        #col = col_BrGn,
+        col = viridis_pal(option = "A")(24),
+        show_row_dend = F,
+        row_split = markers_ordered$cell_group,
+        show_column_dend = F,
+        show_column_names = TRUE,
+        show_row_names = F,
+        row_names_gp = gpar(fontsize = 6),
+        row_names_side = "right",
+        cluster_columns = F,
+        cluster_rows = T,
+        cluster_row_slices = F,
+        row_gap = unit(2, "mm"),
+        border = T,
+        right_annotation = right_labels,
+        name = "Scaled Expr")
+dev.off()
+
+
+```
+
+Export all gene lists as csvs
+```{r}
+
+write.csv(dose_fits, "/Users/matthewjwither/Desktop/Dose_ErkNFAT_DEGs.csv")
+write.csv(aff_fits, "/Users/matthewjwither/Desktop/Affinity_ErkNFAT_DEGs.csv")
+
+aff_all <- readRDS(paste0(main_dir, "aff_fits_fullgenelist.rds"))
+dose_all <- readRDS(paste0(main_dir, "dose_fits_fullgenelist.rds"))
+stim_all <- readRDS(paste0(main_dir, "stim_fits_fullgenelist.rds"))
+
+write.csv(aff_all, "/Users/matthewjwither/Desktop/Affinity_Full_DEGs.csv")
+write.csv(dose_all, "/Users/matthewjwither/Desktop/Dose_Full_DEGs.csv")
+write.csv(stim_all, "/Users/matthewjwither/Desktop/Stim_Full_DEGs.csv")
+
+
+```
+
+Export list of co-expression cluster genes
+```{r}
+
+write.csv(regulons_final[,1:2], "coexpr_cluster_genes.csv")
+
+
+```
+
+

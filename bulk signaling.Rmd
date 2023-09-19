@@ -1,0 +1,518 @@
+---
+title: "Bulk T Cell Signaling Analysis"
+author: "Matthew Wither"
+date: "1/1/23"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+Load packages
+```{r Load packages, eval=FALSE}
+library(DescTools)
+library(tidyr)
+library(ggplot2)
+library(ggridges)
+library(dplyr)
+library(ggpubr)
+library(RColorBrewer)
+suppressPackageStartupMessages(library(ComplexHeatmap))
+library(gplots)
+library(cluster)
+library(zoo)
+library(dendextend)
+library(viridis)
+library(plotly)
+library(circlize)
+library(ggforce)
+library(reshape2)
+library(pbmcapply)
+library(randomForest)
+library(caret)
+library(patchwork)
+library(pbmcapply)
+library(ClassDiscovery)
+library(dtwclust)
+
+```
+
+Functions
+```{r User-defined functions, eval=FALSE}
+
+DataCleanUp <- function(df, condition, celldrop = FALSE, tps_total = NA, tps_consec = NA, H2B_thresh = 0.7, Arm = 2, convert_time = 0, t_max) {
+  if ("Track" %in% colnames(df)) {
+    df$Track <- as.factor(df$Track)
+  }
+  
+  #Add exclusion column
+  df$Exclusion <- 1
+  
+  if (Arm == 1) { 
+    df <- subset(df, select = -c(Death, Division, Stain)) #Remove tags if this is early signaling data where these are not used
+    df <- df[complete.cases(df),] #Remove rows with NaN - This was an error in the low in/high in workaround. Should be fixed after 9/30/21
+  }
+  
+  if (convert_time != 0) {
+    #Convert real time to timepoint no. (i.e measurement number) Convert back to real time before returning out.df
+    df$Time <- df$Time/convert_time
+  }
+  
+  databytrack <- split(df, df$Track)
+  for (i in 1:length(databytrack)) {
+    temp <- databytrack[[i]]
+    
+    if (celldrop) {
+      start <- temp$Time[1]
+      temp$Time <- temp$Time - start
+    }
+    
+    #Set to limit time series
+    temp <- subset(temp, Time <= t_max)
+    
+    #Exclude based on H2B signal.
+    temp <- subset(temp, H2B >= H2B_thresh)
+    
+    #Exclude if there is too much nucleus outside of cytoplasm - i.e out of focus cell
+    temp <- subset(temp, Nuc_only_Area <= 0.1)
+    
+    #No further testing if all timepoints fail
+    if (length(temp$Time) > 0) {
+      #Exclude if no IRF4 measurement
+      # if (is.nan(temp$Stain1_nuc[length(temp$Stain1_nuc)])) {
+      #   temp$Exclusion <- 0
+      # }
+      
+      #Exclude based on total no. of timepoints
+      if (!is.na(tps_total)) {
+        if (length(temp$Time) < tps_total) {
+          temp$Exclusion <- 0
+        }
+      }
+      
+      #Exclude based on too many missing consecutive timepoints
+      #Re-write to go backwards for IRF4 data.
+      if (!is.na(tps_consec) && temp$Exclusion[1] != 0) {
+        t.dist = c(1)
+        for (t in 1:(length(temp$Time)-1)) {
+          t.dist[t] <- temp$Time[t+1] - temp$Time[t]
+        }
+        if (max(t.dist, na.rm = T) > tps_consec) {
+          temp$Exclusion <- 0
+        }
+      }
+      
+    }
+    
+    
+    #Add track back in.
+    databytrack[[i]] <- temp
+  }
+  
+  out.df <- bind_rows(databytrack)
+  
+  if (convert_time != 0) {
+    #Convert time back to real time
+    out.df$Time <- (out.df$Time)* convert_time
+  }
+  
+  out.df$Cond <- condition
+  out.df$Erk_corr <- out.df$Erk_corr*-1
+  
+  out.df$ID <- paste(out.df$Cond, out.df$Track, sep = " ")
+  out.df <- subset(out.df, Exclusion == 1)
+  out.df$Track <- factor(out.df$Track)
+  
+  out.df
+}
+
+CalcVelocity <- function(df) {
+  databytrack <- split(df, df$Track)
+
+  for (i in 1:length(databytrack)) {
+    temp <- databytrack[[i]]
+    
+    t <- temp$Time
+    x <- temp$x
+    y <- temp$y
+    
+    velocities <- t
+    
+    for (j in 1:(length(velocities)-1)) {
+      dx <- x[j+1] - x[j]
+      dy <- y[j+1] - y[j]
+      dt <- t[j+1] - t[j]
+      #Pythagorean theorem
+      c <- sqrt((dx*dx) + (dy*dy))
+      velocities[j] <- c/dt
+    }
+    velocities[length(velocities)] <- NA
+    temp$Velocity <- velocities
+    
+    databytrack[[i]] <- temp
+  }
+  out.df <- bind_rows(databytrack)
+  out.df
+}
+
+CurveFit <- function(df, span_start = 0.25, no_tps, t_interval = 1, t_start = 1, corr_coeff = FALSE, convert_time) {
+  databytrack <- split(df, df$Track)
+  for (i in 1:length(databytrack)) {
+    temp <- databytrack[[i]]
+    
+    if (convert_time != 0) {
+      #Convert real time to timepoint no. (i.e measurement number) Convert back to real time before smoothing
+      temp$Time <- temp$Time/convert_time + 1
+    }
+
+    df1 <- data.frame("Time" = seq(t_start, no_tps, t_interval), "NFAT" = NA, "Erk" = NA)
+    
+    if (!corr_coeff) {
+      for (j in 1:length(temp$NFAT)) {
+        df1$NFAT[temp$Time[j]] <- temp$NFAT[j]
+        df1$Erk[temp$Time[j]] <- temp$Erk[j]
+      }
+    } else {
+      for (j in 1:length(temp$NFAT)) {
+        df1$NFAT[temp$Time[j]] <- temp$NFAT_corr[j]
+        df1$Erk[temp$Time[j]] <- temp$Erk_corr[j]
+      }
+    }
+    
+    #Fit curve for NFAT
+    result <- 0
+    a <- span_start
+    while (result == 0) {
+      loess.NFAT <- try(loess(NFAT ~ Time, data=df1, span = a, na.action = na.exclude, silent=T))
+      if(loess.NFAT$s != "NaN"){
+        result <- 1
+        a <- span_start
+        smooth.NFAT <- predict(loess.NFAT, newdata = df1$Time, se = F)
+      } else {
+        a <- a + 0.05
+      }
+    }
+    
+    #Fit curve for Erk
+    result <- 0
+    a <- span_start
+    while (result == 0) {
+      loess.Erk <- try(loess(Erk ~ Time, data=df1, span = a, na.action = na.exclude, silent=T))
+      if(loess.Erk$s != "NaN"){
+        result <- 1
+        a <- span_start
+        smooth.Erk <- predict(loess.Erk, newdata = df1$Time, se = F)
+      } else {
+        a <- a + 0.05
+      }
+    }
+    
+    temp.sm <- data.frame("Track" = rep.int(temp$Track[1], no_tps), "Cond" = rep.int(temp$Cond[1], no_tps),
+                          "Time" = seq(t_start, no_tps, t_interval), "NFAT" = smooth.NFAT, "Erk" = smooth.Erk)
+    
+    if (convert_time != 0) {
+      #Convert time back to real time
+      temp.sm$Time <- (temp.sm$Time-1)*convert_time
+    }
+    #Add track back in.
+    databytrack[[i]] <- temp.sm
+  }
+  df <- bind_rows(databytrack)
+  df
+}
+
+SmoothedDataFilter <- function(df, frac_acceptable_missing_data = 0.15, tmax = trange) {
+  databytrack <- split(df, df$Track)
+  exclusion_list <- c()
+  for (i in 1:length(databytrack)) {
+    temp <- databytrack[[i]]
+    temp <- subset(temp, Time <= tmax)
+    if (length(which(is.na(temp$NFAT))) / (length(temp$Time)) >= frac_acceptable_missing_data) {
+      exclusion_list[length(exclusion_list)+1] <- i
+    }
+    databytrack[[i]] <- temp
+  }
+  
+  if (length(exclusion_list >= 1)) {
+    tracks_out <- databytrack[-exclusion_list]
+  } else {
+    tracks_out <- databytrack
+  }
+  
+  tracks_out <- bind_rows(tracks_out)
+  tracks_out$Track <- factor(tracks_out$Track)
+  tracks_out
+  
+}
+
+CalcDerivative <- function(df, dt = 1) {
+  databytrack <- split(df, df$Track)
+  pathways <- c("Erk", "NFAT")
+  for (i in 1:length(databytrack)) {
+    temp <- databytrack[[i]]
+    
+    for (pathway in 1:length(pathways)) {
+      values <- temp[,pathways[pathway]]
+      derivs <- rep(NA, length(temp$Time))
+      for (t in 1:(length(values)-1)) {
+        derivs[t] <- (values[t+1] - values[t])/dt
+      }
+      temp[,paste0("d",pathways[pathway], "dt")] <- c(NA, derivs[-length(derivs)])
+    }
+    
+    databytrack[[i]] <- temp
+  }
+  out.df <- bind_rows(databytrack)
+  out.df
+}
+
+CalcMeanSD <- function(df, AreaMean = FALSE, VelocityMean = FALSE) {
+  
+  if (nrow(df) > 0) {
+    #Get condition
+    condition <- df$Cond[1]
+    #Split data by timepoint
+    tps <- split(df, df$Time)
+    #Extract pathway data by timepoint
+    Erk <- lapply(tps, "[[", "Erk")
+    NFAT <- lapply(tps, "[[", "NFAT")
+    
+    #Calculate means
+    Erk_means <- sapply(Erk, mean, na.rm = TRUE)
+    NFAT_means <- sapply(NFAT, mean, na.rm = TRUE)
+    
+    #Calculate standard deviations
+    Erk_sd <- sapply(Erk, sd, na.rm = TRUE)
+    NFAT_sd <- sapply(NFAT, sd, na.rm = TRUE)
+    
+    Erk_se <- sapply(Erk, standard_error)
+    NFAT_se <- sapply(NFAT, standard_error)
+    
+    #Export as data frames with same column names as data for ease of plotting
+    out.df <- data.frame("Time" = as.numeric(names(tps)), "Erk" = Erk_means, "NFAT" = NFAT_means,
+                         "ErkSD" = Erk_sd, "NFATSD" = NFAT_sd,
+                         "ErkSE" = Erk_se, "NFATSE" = NFAT_se,
+                         "Cond" = condition)
+    
+    if (AreaMean) {
+      Area <- lapply(tps, "[[", "Area")
+      Area_means <- sapply(Area, mean, na.rm = TRUE)
+      Area_sd <- sapply(Area, sd, na.rm = TRUE)
+      
+      out.df$Area <- Area_means
+      out.df$AreaSD <- Area_sd
+    }
+    
+    if (VelocityMean) {
+      Velocity <- lapply(tps, "[[", "Velocity")
+      Velocity_means <- sapply(Velocity, mean, na.rm = TRUE)
+      Velocity_sd <- sapply(Velocity, sd, na.rm = TRUE)
+      
+      out.df$Velocity <- Velocity_means
+      out.df$VelocitySD <- Velocity_sd
+    }
+    
+  } else {
+     out.df <- df
+  }
+ 
+  out.df
+}
+
+standard_error <- function(x) sd(x, na.rm = TRUE) / sqrt(length(x))
+
+DataFilter <- function(df, keepDead = FALSE) {
+  df$ID <- paste(df$Cond, df$Track, sep = " ")
+  df <- subset(df, Exclusion == 1)
+  if (!keepDead & "Death" %in% colnames(df)) {
+    df <- subset(df, is.nan(Death))
+  }
+  df$Track <- factor(df$Track)
+  df
+}
+
+```
+
+----------------------------------------------------------------
+
+Set parameters
+```{r Parameters}
+dir <- "/Users/matthewjwither/Desktop/csvs_manuscript/Bulk Data"
+setwd(dir)
+
+#2 replicates
+conditions <- c("20220517_20pmolA", "20220517_2pmolA", "20220517_02pmolA", "20220517_80pmolPA", "20220517_20pmolPA",
+                "20220428_20pmolA", "20220428_2pmolA", "20220428_02pmolA", "20220428_80pmolPA", "20220428_20pmolPA")
+
+Erk_base <- 0.3443
+NFAT_base <- 0.2314
+
+legend.colors = c("Erk" = "blue", "NFAT" = "red")
+legend.colors2 = c("Erk" = "blue", "NFAT" = "red", "Velocity" = "black", "Size" = "palegreen3")
+scatter_colors <-c("02pmolA" = "plum1", "2pmolA" = "mediumorchid2", "20pmolA" = "darkorchid3", "20pmolPA" = "darkseagreen3", "80pmolPA" = "forestgreen", "Rest" = "grey60")
+
+theme_set(theme_bw())
+
+```
+
+Load Bulk Data from MATLAB
+```{r}
+
+bulk_infiles <- paste0(conditions, "_BULK.csv")
+
+bulkdata <- lapply(bulk_infiles, read.csv, header=TRUE)
+
+#Filter cells
+for (i in 1:length(bulkdata)) {
+  temp <- bulkdata[[i]]
+  temp <- subset(temp, H2B >= 0.7 & Nuc_only_Area <= 0.1)
+  temp$Cond <- conditions[i]
+  bulkdata[[i]] <- temp
+}
+
+bulkdata <- bind_rows(bulkdata)
+bulkdata$NFAT <- bulkdata$NFAT - NFAT_base
+bulkdata$Erk <- bulkdata$Erk - Erk_base
+
+#Set negative values to zero
+bulkdata$Erk[which(bulkdata$Erk < 0)] <- 0
+bulkdata$NFAT[which(bulkdata$NFAT < 0)] <- 0
+
+#Calc relative activity for each data point
+#bulkdata$relative <- bulkdata$NFAT/(bulkdata$Erk + bulkdata$NFAT)
+
+
+```
+
+Get QC distributions - i.e #cells excluded - Fig S1B
+```{r}
+
+bulk_infiles <- paste0(conditions, "_BULK.csv")
+bulkdata <- lapply(bulk_infiles, read.csv, header=TRUE)
+
+#Do not filter, instead plot all cells based on the 2 filters
+bulkdata <- bind_rows(bulkdata)
+
+plot1 <- ggplot(data = bulkdata, aes(x = H2B, y = Nuc_only_Area)) +
+  geom_point(size = 0.25, alpha = 0.05) +
+  geom_hline(aes(yintercept = 0.1), color = "red") +
+  geom_vline(aes(xintercept = 0.7), color = "red") +
+  theme_pubr()
+
+dens1 <- ggplot(bulkdata, aes(x = H2B)) + 
+  geom_density() +
+  geom_vline(aes(xintercept = 0.7), color = "red") +
+  theme_void()
+
+dens2 <- ggplot(bulkdata, aes(x = Nuc_only_Area)) + 
+  geom_density() +
+  geom_vline(aes(xintercept = 0.1), color = "red") +
+  theme_void() + 
+  coord_flip()
+
+# dens1 + plot_spacer() + plot1 + dens2 + 
+#   plot_layout(ncol = 2, nrow = 2, widths = c(4, 1), heights = c(1, 4))
+
+plot1
+
+test <- bulkdata[,1:9]
+test2 <- test[complete.cases(test),]
+
+nrow(subset(bulkdata, H2B >= 0.7 & Nuc_only_Area <= 0.1))/nrow(test2)
+
+
+```
+
+Compare replicate signaling - Figure S2
+``` {r}
+
+meta <- strsplit(bulkdata$Cond, "_")
+dates <- lapply(meta, function(x) x[[1]])
+new_conds <- lapply(meta, function(x) x[[2]])
+
+bulkdata$date <- factor(unlist(dates))
+bulkdata$Cond <- factor(unlist(new_conds), levels = c("20pmolA", "2pmolA", "02pmolA", "80pmolPA", "20pmolPA"))
+
+pMHC_colors <-c("02pmolA" = "plum1", "2pmolA" = "mediumorchid2", "20pmolA" = "darkorchid3", "20pmolPA" = "#E38E14", "80pmolPA" = "#A17339")
+
+ggplot(data = bulkdata, aes(x = Time, y = Erk, color = Cond)) +
+  stat_summary(geom="linerange", fun.data = mean_cl_normal, fun.args = list(conf.int = .95), size=0.75, show.legend = F) +
+  #stat_summary(geom="linerange", fun.data = median_IQR, size=0.75, show.legend = F) +
+  stat_summary(fun=mean, geom="line", size=0.75, show.legend = F, aes(group = Cond)) +
+  #stat_summary(fun=mean, geom="line", size=0.5, show.legend = T, aes(group = Cond, color = "Erk", y = Erk)) +
+  #labs(x = "Time (hr)", title = "Mean +/- 95% CI")
+  xlim(0,29) +
+  #ylab("Erk Activity (a.u)") +
+  xlab("Time (hrs)") +
+  geom_hline(aes(yintercept = 0), linetype = "dashed", size = 1) +
+  scale_color_manual(values = pMHC_colors) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.text.y = element_text(size = 14), axis.title = element_text(size = 14, face = "bold"),
+        axis.text.x = element_text(size = 14), strip.text = element_text(size = 14, face = "bold")) +
+  facet_wrap(~date) + 
+  
+  ggplot(data = bulkdata, aes(x = Time, y = NFAT, color = Cond)) +
+  stat_summary(geom="linerange", fun.data = mean_cl_normal, fun.args = list(conf.int = .95), size=0.75, show.legend = F) +
+  #stat_summary(geom="linerange", fun.data = median_IQR, size=0.75, show.legend = F) +
+  stat_summary(fun=mean, geom="line", size=0.75, show.legend = T, aes(group = Cond)) +
+  #stat_summary(fun=mean, geom="line", size=0.5, show.legend = T, aes(group = Cond, color = "Erk", y = Erk)) +
+  #labs(x = "Time (hr)", title = "Mean +/- 95% CI")
+  xlim(0,29) +
+  #ylab("Erk Activity (a.u)") +
+  xlab("Time (hrs)") +
+  geom_hline(aes(yintercept = 0), linetype = "dashed", size = 1) +
+  scale_color_manual(values = pMHC_colors) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.text.y = element_text(size = 14), axis.title = element_text(size = 14, face = "bold"),
+        axis.text.x = element_text(size = 14), strip.text = element_text(size = 14, face = "bold")) +
+  facet_wrap(~date)
+
+
+```
+
+Figure 2C
+```{r}
+
+fig2 <- bulkdata
+
+ggplot(data = fig2, aes(x = Time, y = Erk, color = Cond)) +
+  stat_summary(geom="linerange", fun.data = mean_cl_normal, fun.args = list(conf.int = .99), size=1, show.legend = F) +
+  stat_summary(fun=mean, geom="line", size=1, show.legend = T, aes(group = Cond)) +
+  #labs(x = "Time (hr)", title = "Mean +/- 95% CI")
+  xlim(0,29) +
+  #ylab("Erk Activity (a.u)") +
+  xlab("Time (hrs)") +
+  geom_vline(aes(xintercept = 15)) +
+  geom_hline(aes(yintercept = 0), linetype = "dashed", size = 1) +
+  scale_color_manual(values = pMHC_colors) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.text.y = element_text(size = 14), axis.title = element_text(size = 14, face = "bold"),
+        axis.text.x = element_text(size = 14), strip.text = element_text(size = 14, face = "bold"))
+
+#Get n for each condition
+fig2_cond_split <- split(fig2, fig2$Cond)
+for (i in 1:length(fig2_cond_split)) {
+  df <- fig2_cond_split[[i]]
+  df$Track <- factor(df$Track)
+  print(as.character(df$Cond[1]))
+  print(length(levels(df$Track)))
+}
+
+#Get n for each timepoint per condition per experiment
+fig2_n <- as.data.frame(table(bulkdata[,c("Time", "Cond", "date")]))
+range(subset(fig2_n, Freq != 0)$Freq)
+
+```
+
+Calculate means and sd/se for mathematical modeling
+```{r}
+
+bulk_split <- split(bulkdata, bulkdata$Cond)
+bulk_means <- lapply(bulk_split, CalcMeanSD)
+bulk_means <- bind_rows(bulk_means)
+bulk_means <- subset(bulk_means, Time <= 30)
+
+#write.csv(bulk_means, "pMHC_signaling_means.csv")
+
+```
+
+

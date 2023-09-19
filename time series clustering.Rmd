@@ -1,0 +1,869 @@
+---
+title: "Erk/NFAT clustering"
+author: "Matthew Wither"
+date: "5/9/23"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+  
+Load packages
+```{r Load packages, eval=FALSE}
+library(ggplot2)
+library(DescTools)
+library(tidyr)
+library(dplyr)
+library(dtwclust)
+library(circlize)
+suppressPackageStartupMessages(library(ComplexHeatmap))
+library(pbmcapply)
+library(patchwork)
+
+```
+
+Functions
+```{r User-defined functions, eval=FALSE}
+
+CalcDerivative <- function(df, dt = 1) {
+  databytrack <- split(df, df$Track)
+  pathways <- c("Erk", "NFAT")
+  for (i in 1:length(databytrack)) {
+    temp <- databytrack[[i]]
+    
+    for (pathway in pathways) {
+      values <- temp[[pathway]]
+      derivs <- rep(NA, length(temp$Time))
+      for (t in 1:(length(values)-1)) {
+        derivs[t] <- (values[t+1] - values[t])/dt
+      }
+      temp[,paste0("d",pathway, "dt")] <- c(NA, derivs[-length(derivs)])
+    }
+    
+    databytrack[[i]] <- temp
+  }
+  out.df <- bind_rows(databytrack)
+  out.df
+}
+
+compute_percentage <- function(x) {x/sum(x) * 100}
+
+pathway_scale <- function(x){(x-min(x, na.rm = T))/(quantile(x, probs = 0.99, na.rm = T)-min(x, na.rm = T))}
+
+Calc_IA2 <- function(df, window = 2) {
+
+  IA <- df[,c("Track", "Cond")]
+  
+  dfnfat <- df[,colnames(df)[startsWith(colnames(df), "NFAT_ts")]]
+  dferk <- df[,colnames(df)[startsWith(colnames(df), "Erk_ts")]]
+  
+  colnames(dfnfat) <- colnames(dferk) <- 2:15
+  
+  dfnfat <- pivot_longer(dfnfat, cols = 1:14, names_to = "Time", values_to = "NFAT")
+  dferk <- pivot_longer(dferk, cols = 1:14, names_to = "Time", values_to = "Erk")
+  
+  df2 <- cbind(dfnfat, dferk[,"Erk"])
+  df2$Track <- rep(df$Track, each = 14)
+  df2$Track <- factor(df2$Track, levels = IA$Track)
+  df2$Time <- as.numeric(df2$Time)
+  
+  databytrack <- split(df2, df2$Track)
+  
+  pb <- progressBar(min = 0, max = length(databytrack), initial = 0, style = "ETA")
+  for (i in 1:length(databytrack)) {
+    
+    temp_in <- databytrack[[i]]
+    
+    for (t_start in 2:(15-window)) {
+      t_end <- t_start+window
+      
+      temp_in2 <- subset(temp_in, Time >= t_start & Time <= t_end)
+      
+      NFAT_AUC <- try(AUC(x=temp_in2$Time, y=temp_in2$NFAT, method="spline"))
+      Erk_AUC <- try(AUC(x=temp_in2$Time, y=temp_in2$Erk, method="spline"))
+      
+      #Print window range as colnames
+      #IA[names(databytrack)[i],paste0("NFAT_", as.character(t_start), ":", as.character(t_end))] <- NFAT_AUC
+      #IA[names(databytrack)[i],paste0("Erk_", as.character(t_start), ":", as.character(t_end))] <- Erk_AUC
+      
+      #Print window center time as colnames
+      IA[names(databytrack)[i],paste0("NFAT_", as.character(t_start+1))] <- NFAT_AUC
+      IA[names(databytrack)[i],paste0("Erk_", as.character(t_start+1))] <- Erk_AUC
+      
+    }
+    setTxtProgressBar(pb,i)
+  }
+  close(pb)
+  
+  IA
+
+}
+
+FindPulse <- function(df, Erk_mean, NFAT_mean, buffer = 0.95) {
+  databytrack <- split(df, df$Track)
+  
+  for (i in names(databytrack)) {
+    temp <- databytrack[[i]]
+    temp_e <- subset(temp, Erk >= Erk_mean*buffer & Time > 3 & dErkdt > 0)
+    temp_n <- subset(temp, NFAT >= NFAT_mean*buffer & Time > 3 & dNFATdt > 0)
+    
+    #Find consecutive time windows of pulsing
+    windows_e <- split(temp_e$Time, cumsum(c(1, diff(temp_e$Time) != 1)))
+    windows_n <- split(temp_n$Time, cumsum(c(1, diff(temp_n$Time) != 1)))
+    
+    #Find windows of at least 2 hrs
+    windows_e <- windows_e[lengths(windows_e)>1]
+    windows_n <- windows_n[lengths(windows_n)>1]
+    
+    #Extract metrics
+    if (length(windows_e) == 0) {
+      temp[1,"Erkpeak_amp"] <- 0
+      temp[1,"Erkpeak_t"] <- 0
+    } else {
+      peaks <- c()
+      for (w in 1:length(windows_e)) {
+        peak_t <- unname(rev(unlist(windows_e[[w]]))[1])
+        peaks[w] <- temp$Erk[match(peak_t, temp$Time)]
+      }
+      temp[1,"Erkpeak_amp"] <- max(peaks)
+      temp[1,"Erkpeak_t"] <- temp$Time[match(max(peaks), temp$Erk)]
+    }
+    
+    if (length(windows_n) == 0) {
+      temp[1,"NFATpeak_amp"] <- 0
+      temp[1,"NFATpeak_t"] <- 0
+    } else {
+      peaks <- c()
+      for (w in 1:length(windows_n)) {
+        peak_t <- unname(rev(unlist(windows_n[[w]]))[1])
+        peaks[w] <- temp$NFAT[match(peak_t, temp$Time)]
+      }
+      temp[1,"NFATpeak_amp"] <- max(peaks)
+      temp[1,"NFATpeak_t"] <- temp$Time[match(max(peaks), temp$NFAT)]
+    }
+    
+    databytrack[[i]] <- temp
+
+  }
+  
+  out.df <- bind_rows(databytrack)
+  out.df
+  
+}
+
+RowIntegral <- function(values) {
+  window_size <- length(values)
+  DescTools::AUC(x=1:window_size, y=values, method="spline")
+}
+
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+
+Detect_Multi_Pulse <- function(df, Erk_mean, NFAT_mean, buffer = 0.95) {
+  databytrack <- split(df, df$Track)
+  
+  for (i in names(databytrack)) {
+    temp <- databytrack[[i]]
+    temp_e <- subset(temp, Erk >= Erk_mean*buffer & Time > 3 & dErkdt > 0)
+    temp_n <- subset(temp, NFAT >= NFAT_mean*buffer & Time > 3 & dNFATdt > 0)
+    
+    #Find consecutive time windows of pulsing
+    windows_e <- split(temp_e$Time, cumsum(c(1, diff(temp_e$Time) != 1)))
+    windows_n <- split(temp_n$Time, cumsum(c(1, diff(temp_n$Time) != 1)))
+    
+    #Find windows of at least 2 hrs
+    windows_e <- windows_e[lengths(windows_e)>1]
+    windows_n <- windows_n[lengths(windows_n)>1]
+    
+    #Record number of pulses per pathway per cell
+    temp[1,"num_Erkpeaks"] <- length(windows_e)
+    temp[1,"num_NFATpeaks"] <- length(windows_n)
+    
+    databytrack[[i]] <- temp
+
+  }
+  
+  out.df <- as.data.frame(bind_rows(databytrack))
+  out.df
+  
+}
+
+CalcIntegratedActivity <- function(df, window = 1, base_subtract = include.baseline, Erk_baseline = Erk_base, NFAT_baseline = NFAT_base, tmax) {
+
+  if(base_subtract) {
+    df$Erk <- df$Erk - Erk_baseline
+    df$NFAT <- df$NFAT - NFAT_baseline
+    #Set negative activity to zero
+    df$NFAT[which(df$NFAT < 0)] <- 0
+    df$Erk[which(df$Erk < 0)] <- 0
+  }
+  
+  databytrack <- split(df, df$Track)
+  
+  print(df$Cond[1])
+  #Progress bar
+  pb <- txtProgressBar(min = 0, max = length(names(databytrack)), initial = 0, style = 3) 
+  
+  out.df <- data.frame("Track" = names(databytrack), "Window" = NA, "Start" = NA, "End" = NA, "NFAT" = NA, "Erk" = NA)
+  out.df$Track <- factor(out.df$Track, levels = names(databytrack))
+  out_by_track <- split(out.df, out.df$Track)
+  
+  for (i in 1:length(databytrack)) {
+    
+    setTxtProgressBar(pb,i)
+    
+    temp_out <- out_by_track[[i]]
+    
+    #Find first timepoint for track
+    temp_in <- databytrack[[i]][complete.cases(databytrack[[i]]),]
+    t_min <- min(temp_in$Time)
+    
+    for (t_start in t_min:(tmax-window)) {
+      for (t_end in (t_start+window):tmax){
+        temp_in2 <- subset(temp_in, Time >= t_start & Time <= t_end)
+        
+        #Initialize a new row
+        if (!any(is.na(temp_out$Window))) {
+          temp_out[length(temp_out$Track)+1,"Track"] <- temp_out$Track[1]
+        }
+          
+        rowindex <- which(is.na(temp_out$Window))
+        temp_out[rowindex,"Window"] <- paste0(as.character(t_start), ":", as.character(t_end))
+        temp_out[rowindex,"Start"] <- t_start
+        temp_out[rowindex,"End"] <- t_end
+
+        #Some tracks might be missing data so only report a value if at least 70% of the data is present
+        if ( length(which(is.na(temp_in2$NFAT))) < ((t_end-t_start)*0.3) ) {
+          temp_out[rowindex,"NFAT"] <- try(AUC(x=temp_in2$Time, y=temp_in2$NFAT, method="spline"))
+        } else {
+          temp_out[rowindex,"NFAT"] <- NA
+        }
+
+        if ( length(which(is.na(temp_in2$Erk))) < ((t_end-t_start)*0.3) ) {
+          temp_out[rowindex,"Erk"] <- try(AUC(x=temp_in2$Time, y=temp_in2$Erk, method="spline"))
+        } else {
+          temp_out[rowindex,"Erk"] <- NA
+        }
+
+      }
+    }
+    
+    out_by_track[[i]] <- temp_out
+    
+  }
+  
+  out.df <- bind_rows(out_by_track)
+  out.df$Cond <- df$Cond[1]
+  out.df$ID <- paste(out.df$Cond, as.character(out.df$Track), sep = " ")
+  out.df$range <- out.df$End - out.df$Start
+  
+  close(pb)
+  
+  out.df
+  
+}
+
+```
+
+Cluster single cell traces
+----------------------------------------------------------------
+
+Load saved objects
+```{r}
+
+main_dir <- "/Users/matthewjwither/Desktop/analysis_objects/"
+smoothdata3 <- readRDS(paste0(main_dir, "sc_smoothed_traces.rds"))
+#rf_data <- readRDS(paste0(main_dir, "rf_data.rds"))
+
+legend.colors = c("Erk" = "blue", "NFAT" = "red")
+pMHC_colors <-c("02pmolA" = "plum1", "2pmolA" = "mediumorchid2", "20pmolA" = "darkorchid3", "20pmolPA" = "#E38E14", "80pmolPA" = "#A17339")
+
+theme_set(theme_bw())
+
+```
+
+Sample sc responses from each condition
+```{r}
+
+#Extract timepoints 2-15 since t1 and t16 have the most missing values
+sc_heat_all <- as.matrix(smoothdata3[,c(-1,-2)])
+tracks <- rownames(sc_heat_all)
+heat_erk <- pathway_scale(sc_heat_all[,18:31])
+heat_nfat <- pathway_scale(sc_heat_all[,2:15])
+sc_heat_all <- as.matrix(bind_cols(heat_erk, heat_nfat))
+rownames(sc_heat_all) <- tracks
+sc_heat_all <- sc_heat_all[complete.cases(sc_heat_all),]
+
+tsdf <- as.data.frame(sc_heat_all)
+tsdf$Cond <- smoothdata3$Cond[match(rownames(tsdf),smoothdata3$Track)]
+tsdf$Track <- rownames(tsdf)
+
+#Downsample for balanced clustering
+smooth_split <- split(tsdf, tsdf$Cond)
+tracklist <- c()
+for (i in 1:length(smooth_split)) {
+  set.seed(25)
+  df <- smooth_split[[i]]
+  df$Track <- factor(df$Track)
+  print(as.character(df$Cond[1]))
+  print(length(levels(df$Track)))
+  samples <- sample(levels(df$Track), 220)
+  tracklist <- c(tracklist, samples)
+}
+
+sampled_cells <- subset(tsdf, Track %in% tracklist)
+
+#Get raw activities for the tracks used in the heatmaps
+col_drops <- c("NFAT_ts_1", "NFAT_ts_16", "Erk_ts_1", "Erk_ts_16")
+sampled_cells_raw <- smoothdata3[which(rownames(smoothdata3) %in% tracklist), colnames(smoothdata3)[!(colnames(smoothdata3) %in% col_drops)]]
+
+
+```
+
+Cluster cells - dtwclust
+```{r}
+
+sc_list <- as.list(data.frame(t(sampled_cells[,1:28])))
+sc_list <- lapply(sc_list, function(x) {as.matrix(data.frame(Erk = x[1:14], NFAT = x[15:28]))})
+
+set.seed(2)
+d <- tsclust(sc_list, k = 8, type = "partitional", distance = "gak", centroid = "shape")
+
+sigstate <- data.frame(Track = sampled_cells$Track, SS = d@cluster, Cond = sampled_cells$Cond)
+sigstate$SS2 <- as.factor(sigstate$SS)
+sigstate$SS2 <- sigstate$SS
+
+clust_labels <- rowAnnotation(Cond = factor(sigstate$Cond, levels = names(pMHC_colors)),
+                              col = list(Cond = pMHC_colors),
+                              simple_anno_size = unit(2, "mm"),
+                              show_annotation_name = FALSE, show_legend = F)
+
+sc_heat_all <- as.matrix(sampled_cells[,1:28])
+
+# col_greyscale = colorRamp2(c(0.1, 0.55, 1), c("white", "grey", "black"))
+# 
+# Heatmap(sc_heat_all,
+#         col = col_greyscale,
+#         cluster_columns = F,
+#         show_column_names = F,
+#         show_row_names = F,
+#         row_split = sigstate[,"SS2"],
+#         cluster_row_slices = T,
+#         show_row_dend = F,
+#         left_annotation = clust_labels,
+#         column_split = factor(rep(c("Erk", "NFAT"), each = 14), levels = c("Erk", "NFAT")))
+
+
+sigstate$SS2[which(sigstate$SS == 2)] <- "A"
+sigstate$SS2[which(sigstate$SS == 6)] <- "B"
+sigstate$SS2[which(sigstate$SS == 7)] <- "D"
+sigstate$SS2[which(sigstate$SS == 4)] <- "C"
+sigstate$SS2[which(sigstate$SS == 3)] <- "G"
+sigstate$SS2[which(sigstate$SS == 1)] <- "F"
+sigstate$SS2[which(sigstate$SS == 5)] <- "E"
+sigstate$SS2[which(sigstate$SS == 8)] <- "H"
+sigstate$SS2 <- factor(sigstate$SS2, levels = LETTERS[1:8])
+
+#Counts by condition
+counts <- sigstate %>% dplyr::count(Cond, SS2, sort = F)
+totals <- sigstate %>% dplyr::count(Cond, sort = F)
+
+#Convert to fraction
+counts$total <- totals$n[match(counts$Cond, totals$Cond)]
+counts$frac <- counts$n/counts$total
+
+#Counts by cluster
+counts2 <- sigstate %>% dplyr::count(SS2, Cond, sort = F)
+totals2 <- sigstate %>% dplyr::count(SS2, sort = F)
+
+counts2$total <- totals2$n[match(counts2$SS2, totals2$SS2)]
+counts2$frac <- counts2$n/counts2$total
+
+```
+
+Plot clustered heatmap with summary annotations
+```{r}
+
+#Find mean Erk and NFAT raw activities
+sc_heat_nfat_raw <- as.matrix(sampled_cells_raw[,3:16])
+sc_heat_erk_raw <- as.matrix(sampled_cells_raw[,17:30])
+sc_heat_all_raw <- cbind(sc_heat_erk_raw, sc_heat_nfat_raw)
+
+mean_raw_erk <- mean(sc_heat_erk_raw)
+mean_raw_nfat <- mean(sc_heat_nfat_raw)
+axis_trans_factor <- mean_raw_nfat/mean_raw_erk
+
+#Mean traces of raw values - i.e dual y axis
+panel_fun_meantrace_raw = function(index, nm) {
+    df = sc_heat_all_raw[sigstate$Track[index],]
+    means <- colMeans(df)
+    df <- data.frame(Time = 2:15, Erk = means[1:14], NFAT = means[15:28])
+    
+    axes_limits <- c(0.05, ((mean_raw_erk*2)-0.05))
+    
+    g = ggplot(df, aes(x = Time)) +
+      geom_line(aes(y = Erk, color = "Erk"), show.legend = F) +
+      geom_line(aes(y = NFAT/axis_trans_factor, color = "NFAT"), show.legend = F) +
+      geom_hline(aes(yintercept = mean_raw_erk), linetype = "dashed") +
+      scale_color_manual(values = legend.colors) +
+      scale_x_continuous(breaks = c(4,8,12)) +
+      scale_y_continuous(name = "Erk", sec.axis = sec_axis(trans = ~.*axis_trans_factor, name = "NFAT"), breaks = seq(0,0.3,0.1), limits = axes_limits) +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+            axis.text.x = element_blank(), axis.title = element_blank(),
+            axis.text.y = element_text(color = "blue"), axis.text.y.right = element_text(color = "red"))
+      
+    g = grid.grabExpr(print(g))
+    
+    pushViewport(viewport(yscale = axes_limits))
+    #pushViewport(viewport())
+    grid.rect()
+    grid.draw(g)
+    popViewport()
+}
+
+#Mean traces of scaled values - i.e single y axis
+panel_fun_meantrace_scaled = function(index, nm) {
+    df = sc_heat_all[sigstate$Track[index],]
+    means <- colMeans(df)
+    df <- data.frame(Time = 2:15, Erk = means[1:14], NFAT = means[15:28])
+    
+    g = ggplot(df, aes(x = Time)) +
+      geom_line(aes(y = Erk, color = "Erk"), show.legend = F) +
+      geom_line(aes(y = NFAT, color = "NFAT"), show.legend = F) +
+      ylab("Activity") +
+      #ylim(0.4, 0.85) +
+      geom_hline(aes(yintercept = 0.6), linetype = "dashed") +
+      scale_color_manual(values = legend.colors) +
+      scale_y_continuous(limits = c(0.4, 0.85), breaks = c(0.4, 0.6, 0.8)) +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+            axis.text.x = element_blank(), axis.title = element_blank())
+      
+    g = grid.grabExpr(print(g))
+    
+    pushViewport(viewport(yscale = c(0.4,0.85)))
+    grid.rect()
+    grid.draw(g)
+    popViewport()
+}
+
+panel_fun_barplot = function(index, nm) {
+    clust = sigstate$SS2[index]
+    df <- subset(counts2, SS2 == clust[1])
+    
+    g = ggplot(data = df, aes(x = SS2, y = frac, fill = Cond)) +
+      geom_bar(position="stack", stat = "identity", color = "darkgrey", size = 0, show.legend = F) +
+      labs(x = NULL, y = "Fraction") +
+      scale_fill_manual(values = pMHC_colors) +
+      coord_flip() +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.text = element_blank(),
+            axis.title = element_blank(), axis.ticks.y = element_blank())
+
+      
+    g = grid.grabExpr(print(g))
+    
+    pushViewport(viewport(yscale = c(0,1)))
+    grid.rect()
+    grid.draw(g)
+    popViewport()
+}
+
+
+linked_meantrace = anno_link(align_to = as.character(sigstate$SS2), which = "row", panel_fun = panel_fun_meantrace_raw, 
+    size = unit(2, "cm"), gap = unit(1, "cm"), width = unit(4.25, "cm"))
+
+linked_barplot = anno_link(align_to = as.character(sigstate$SS2), which = "row", panel_fun = panel_fun_barplot, 
+    size = unit(2, "cm"), gap = unit(1, "cm"), width = unit(3.75, "cm"))
+
+
+multi_anno <- rowAnnotation(Mean = linked_meantrace, 
+                            Frac = linked_barplot, annotation_name_rot = 90, gap = unit(2, "mm"))
+
+
+
+col_greyscale_blue = colorRamp2(c(0.1, 0.55, 1), c("white", "grey", "#3690c0"))
+col_greyscale_red = colorRamp2(c(0.1, 0.55, 1), c("white", "grey", "red"))
+
+#Figure 1E
+
+setwd("/Users/matthewjwither/Desktop")
+pdf(file = "Fig1E.pdf", width = 6, height = 9)
+draw(
+  Heatmap(sc_heat_all[,1:14],
+        col = col_greyscale_blue,
+        cluster_columns = F,
+        cluster_rows = T,
+        show_column_names = F,
+        show_row_names = F,
+        row_split = sigstate[,"SS2"],
+        cluster_row_slices = F,
+        show_row_dend = F,
+        name = "Erk Activity",
+        heatmap_legend_param = list(direction = "horizontal")) +
+          
+          Heatmap(sc_heat_all[,15:28],
+        col = col_greyscale_red,
+        cluster_columns = F,
+        cluster_rows = F,
+        show_column_names = F,
+        show_row_names = F,
+        row_split = sigstate[,"SS2"],
+        cluster_row_slices = F,
+        show_row_dend = F,
+        right_annotation = multi_anno,
+        name = "NFAT Activity",
+        heatmap_legend_param = list(direction = "horizontal")),
+        
+        heatmap_legend_side="bottom")
+dev.off()
+
+
+```
+
+Save objects
+```{r}
+
+saveRDS(sigstate, "sigstate_clustering.rds")
+saveRDS(sampled_cells, "sampled_cells_signaling_responses.rds")
+saveRDS(sampled_cells_raw, "sampled_cells_raw_signaling_responses.rds")
+
+```
+
+
+Calculate Dynamic Features
+----------------------------------------------------------------
+Validate pulse quantification with cluster mean traces
+```{r}
+#Extract mean traces to find derivatives
+Calc_cluster_mean <- function(df, cluster) {
+  means <- colMeans(df)
+  out.df <- data.frame(Time = 2:15, Erk = means[1:14], NFAT = means[15:28], Cluster = cluster)
+  out.df
+}
+
+cluster_means <- list()
+for (c in levels(sigstate$SS2)) {
+  in.df <- sc_heat_all_raw[sigstate$Track[which(sigstate$SS2 == c)],]
+  cluster_means[[c]] <- Calc_cluster_mean(in.df, cluster = c)
+}
+cluster_means <- bind_rows(cluster_means)
+  
+axes_limits <- c(0.05, ((mean_raw_erk*2)-0.05))
+ggplot(cluster_means, aes(x = Time, group = Cluster)) +
+  geom_line(aes(y = Erk, color = "Erk"), show.legend = F) +
+  geom_line(aes(y = NFAT/axis_trans_factor, color = "NFAT"), show.legend = F) +
+  geom_hline(aes(yintercept = mean_raw_erk), linetype = "dashed") +
+  scale_color_manual(values = legend.colors) +
+  scale_x_continuous(breaks = c(4,8,12)) +
+  scale_y_continuous(name = "Erk", sec.axis = sec_axis(trans = ~.*axis_trans_factor, name = "NFAT"), breaks = seq(0,0.3,0.1), limits = axes_limits) +
+  facet_wrap(~Cluster) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        axis.text.x = element_blank(), axis.title = element_blank(),
+        axis.text.y = element_text(color = "blue"), axis.text.y.right = element_text(color = "red"))
+
+#Format for IA and derivative functions
+cluster_means$Track <- cluster_means$Cond <- factor(cluster_means$Cluster, levels = LETTERS[1:8])
+cluster_means2 <- as.data.frame(pivot_wider(cluster_means, names_from = Time, values_from = c(NFAT, Erk), names_prefix = "ts_"))
+rownames(cluster_means2) <- cluster_means2$Track
+
+cluster_means2 <- Calc_IA2(cluster_means2)
+cluster_means2 <- pivot_longer(cluster_means2, c(-1,-2), names_to = c(".value", "Time"), names_pattern = "(.+)_(.+)")
+cluster_means2$Time <- as.numeric(cluster_means2$Time)
+cluster_means2$Track <- factor(cluster_means2$Track, levels = levels(cluster_means$Track))
+
+cluster_means2 <- CalcDerivative(cluster_means2)
+
+#Plot derivatives
+ggplot(cluster_means2, aes(x = Time, group = Track)) +
+  geom_line(aes(y = dErkdt, color = "Erk"), alpha = 0.25, show.legend = F) +
+  #geom_line(aes(y = dNFATdt, color = "NFAT"), alpha = 0.25, show.legend = F) +
+  geom_point(aes(y = dErkdt, color = "Erk"), size = 0.5, show.legend = F) +
+  #geom_point(aes(y = dNFATdt, color = "NFAT"), size = 0.5, show.legend = F) +
+  xlim(4,NA) +
+  geom_hline(aes(yintercept = 0)) +
+  scale_color_manual(values = legend.colors) +
+  facet_wrap(~Track, ncol = 1) +
+ggplot(cluster_means2, aes(x = Time, group = Track)) +
+  #geom_line(aes(y = dErkdt, color = "Erk"), alpha = 0.25, show.legend = F) +
+  geom_line(aes(y = dNFATdt, color = "NFAT"), alpha = 0.25, show.legend = F) +
+  #geom_point(aes(y = dErkdt, color = "Erk"), size = 0.5, show.legend = F) +
+  geom_point(aes(y = dNFATdt, color = "NFAT"), size = 0.5, show.legend = F) +
+  xlim(4,NA) +
+  geom_hline(aes(yintercept = 0)) +
+  scale_color_manual(values = legend.colors) +
+  facet_wrap(~Track, ncol = 1)
+
+#Extract pulse information for cluster mean traces to validate metrics
+mean_pulses <- FindPulse(cluster_means2, Erk_mean = mean(cluster_means2$Erk), NFAT_mean = mean(cluster_means2$NFAT), buffer = 0.95)
+mean_pulses <- subset(mean_pulses, Time == 3)
+mean_pulses <- mean_pulses[,(!colnames(mean_pulses) %in% c("Erk", "NFAT", "dErkdt", "dNFATdt", "Time"))]
+
+
+#Fig 2A/D
+#Plot example for quantification schematic
+example_cluster <- subset(cluster_means2, Cond == "B")
+
+ggplot(example_cluster, aes(x = Time, group = Track)) +
+  geom_line(aes(y = NFAT), color = "#3690c0", size = 1, alpha = 0.7, show.legend = F) +
+  geom_point(aes(y = NFAT), color = "#3690c0", size = 1.25, show.legend = F) +
+  geom_hline(aes(yintercept = (mean(cluster_means2$NFAT)*.95)), linetype = "dashed") +
+  ylab("Asmooth") +
+  scale_x_continuous(breaks = c(4,8,12)) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.text.y = element_text(color = "#3690c0"), axis.title.y = element_text(color = "#3690c0")) +
+  
+ggplot(example_cluster, aes(x = Time, group = Track)) +
+  geom_line(aes(y = dNFATdt), color = "black", size = 1, alpha = 0.7, show.legend = F) +
+  geom_point(aes(y = dNFATdt), color = "black", size = 1.25, show.legend = F) +
+  geom_hline(aes(yintercept = 0)) +
+  ylab("dAdt") +
+  scale_x_continuous(breaks = c(4,8,12)) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.text.y = element_text(color = "black")) +
+
+ggplot(subset(cluster_means, Cond == "B"), aes(x = Time, group = Track)) +
+  geom_line(aes(y = NFAT), color = "#3690c0", size = 1, alpha = 0.7, show.legend = F) +
+  geom_point(aes(y = NFAT), color = "#3690c0", size = 1.25, show.legend = F) +
+  ylab("A") +
+  scale_x_continuous(breaks = c(4,8,12)) +
+  ylim(0.15,NA) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.text.y = element_text(color = "#3690c0"), axis.title.y = element_text(color = "#3690c0"))
+  
+
+```
+
+Extract features
+```{r}
+#Smooth traces using 3hr sliding window AUC
+IA <- Calc_IA2(tsdf)
+IAlong <- pivot_longer(IA, c(-1,-2), names_to = c(".value", "Time"), names_pattern = "(.+)_(.+)")
+IAlong$Time <- as.numeric(IAlong$Time)
+IAlong$Track <- factor(IAlong$Track, levels = rownames(tsdf))
+
+#Use smoothed traces from above to compute derivatives
+IAlong <- CalcDerivative(IAlong)
+
+#Quantify pulses
+pulses <- FindPulse(IAlong, Erk_mean = mean(IAlong$Erk), NFAT_mean = mean(IAlong$NFAT), buffer = 0.95)
+#Remove unused rows/columns
+pulses <- subset(pulses, Time == 3)
+pulses <- pulses[,(!colnames(pulses) %in% c("Erk", "NFAT", "dErkdt", "dNFATdt", "Time"))]
+
+#Detect number of pulses per cell
+oscillations <- Detect_Multi_Pulse(IAlong, Erk_mean = mean(IAlong$Erk), NFAT_mean = mean(IAlong$NFAT), buffer = 0.95)
+oscillations <- subset(oscillations, Time == 3)
+oscillations <- oscillations[,(!colnames(oscillations) %in% c("Erk", "NFAT", "dErkdt", "dNFATdt", "Time"))]
+rownames(oscillations) <- oscillations$Track
+oscillations$Erk_osc <- factor(oscillations$num_Erkpeaks)
+oscillations$NFAT_osc <- factor(oscillations$num_NFATpeaks)
+
+
+#AUC Early (2-4 hrs)
+pulses$Erk_early <- apply(tsdf[,1:3], 1, RowIntegral)
+pulses$NFAT_early <- apply(tsdf[,15:17], 1, RowIntegral)
+
+#AUC late (8-15 hrs)
+pulses$Erk_late <- apply(tsdf[,7:14], 1, RowIntegral)
+pulses$NFAT_late <- apply(tsdf[,21:28], 1, RowIntegral)
+
+#Classify pulse as yes or no
+pulses$Erkpeak_occur <- pulses$NFATpeak_occur <- 0
+pulses$Erkpeak_occur[which(pulses$Erkpeak_t > 0)] <- pulses$NFATpeak_occur[which(pulses$NFATpeak_t > 0)] <- 1
+
+```
+
+Pulse Likelihood - Fig 2B
+```{r}
+
+pulse_probs <- data.frame(Cond = levels(pulses$Cond), Pe = 0, Pn = 0, Pen = 0)
+
+#Probabilities of pulse occuring
+pulse_probs$Pe <- unlist(lapply(split(pulses, pulses$Cond), function(x) {sum(x$Erkpeak_occur)/nrow(x)}))
+pulse_probs$Pn <- unlist(lapply(split(pulses, pulses$Cond), function(x) {sum(x$NFATpeak_occur)/nrow(x)}))
+pulse_probs$Pen <- unlist(lapply(split(pulses, pulses$Cond), function(x) { nrow(subset(x, Erkpeak_occur==1 & NFATpeak_occur==1))/nrow(x) }))
+
+#Conditional probabilities
+pulse_probs$Pe_if_n <- pulse_probs$Pen/pulse_probs$Pn
+pulse_probs$Pn_if_e <- pulse_probs$Pen/pulse_probs$Pe
+
+#Correlation between pathways
+pulse_probs$pulse_t_corr <- unlist(lapply(split(pulses, pulses$Cond), function(x) {cor(x$NFATpeak_t, x$Erkpeak_t)}))
+pulse_probs$late_IA_corr <- unlist(lapply(split(pulses, pulses$Cond), function(x) {cor(x$NFAT_late, x$Erk_late)}))
+rownames(pulse_probs) <- pulse_probs$Cond
+
+pulse_probs2 <- pivot_longer(pulse_probs, cols = 2:6, names_to = "conditional", values_to = "prob")
+pulse_probs2$Cond <- factor(pulse_probs2$Cond, levels = levels(pulses$Cond))
+
+
+#plot
+labels <- HeatmapAnnotation(Cond = factor(pulse_probs$Cond, levels = pulse_probs$Cond),
+                              col = list(Cond = pMHC_colors),
+                              simple_anno_size = unit(3, "mm"),
+                              show_annotation_name = FALSE, show_legend = F)
+
+Heatmap(t(as.matrix(pulse_probs[,c("Pe", "Pe_if_n", "Pn", "Pn_if_e", "Pen")])), cluster_rows = F, cluster_columns = F, 
+        bottom_annotation = labels,
+        row_names_side = "left",
+        show_column_names = F,
+        name = "Prob")
+
+#Greyscale
+Heatmap(t(as.matrix(pulse_probs[,c("Pe","Pn")])), cluster_rows = F, cluster_columns = F,
+        col = colorRamp2(c(0.3, 0.65, 1), c("white", "grey", "black")),
+        bottom_annotation = labels,
+        row_names_side = "left",
+        show_column_names = F,
+        name = "Prob")
+
+
+```
+
+Plot number of pulses (i.e. oscillations) - Fig 2C
+```{r}
+
+#Convert to fractions
+osc_fracs <- bind_rows(lapply(split(oscillations, oscillations$Cond), FUN = function(x) {
+  
+  counts_Erk <- as.data.frame(table(x$Erk_osc))
+  counts_NFAT <- as.data.frame(table(x$NFAT_osc))
+  
+  counts_Erk$Frac <- counts_Erk$Freq/nrow(x)
+  counts_NFAT$Frac <- counts_NFAT$Freq/nrow(x)
+  
+  fracs <- bind_rows(counts_Erk, counts_NFAT)
+  fracs$Cond <- x$Cond[1]
+  fracs$pathway <- rep(c("Erk", "NFAT"), each = 4)
+  fracs$pathway <- factor(fracs$pathway)
+  colnames(fracs)[1] <- "num_pulses"
+  return(fracs)
+  
+}))
+
+
+#cond_subset <- c("20pmolA", "02pmolA", "20pmolPA")
+#osc_fracs <- subset(osc_fracs, Cond %in% cond_subset)
+#osc_fracs$Cond <- factor(osc_fracs$Cond, levels = cond_subset)
+
+osc_fracs <- subset(osc_fracs, num_pulses != 0)
+osc_fracs$num_pulses <- factor(osc_fracs$num_pulses)
+
+#export as pdf 4.89 x 3.49 inches
+ggplot(osc_fracs, aes(x = Cond, y = Frac, fill = num_pulses)) +
+  geom_bar(stat = "identity", show.legend = T) +
+  facet_wrap(~pathway) +
+  scale_fill_grey(start = 0.7, end = 0.25) +
+  #scale_color_manual(values = legend.colors) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+
+```
+
+Save dataframe for machine learning (random forest) classifier
+```{r}
+
+rf_data <- cbind(tsdf, pulses[,c(-1,-2)], oscillations[,3:4])
+saveRDS(rf_data, "rf_data.rds")
+
+```
+
+---------------------------------------------------------------
+
+Distribution of features by condition - Fig S2F
+```{r}
+
+#Filter cells with pulse and plot pulse time and amplitude
+pulses_nfat <-pivot_longer(subset(rf_data, NFATpeak_occur == 1), cols = c("NFATpeak_t", "NFATpeak_amp"), names_to = "Feature", values_to = "value")
+pulses_erk <- pivot_longer(subset(rf_data, Erkpeak_occur == 1), cols = c("Erkpeak_t", "Erkpeak_amp"), names_to = "Feature", values_to = "value")
+
+pulses_long <- pivot_longer(rf_data, cols = c("Erk_early", "Erk_late", "NFAT_early", "NFAT_late"), names_to = "Feature", values_to = "value")
+pulses_long$Feature <- factor(pulses_long$Feature, levels = c("Erk_late", "NFAT_late", "Erk_early", "NFAT_early"))
+
+ggplot(pulses_erk, aes(x = Cond, y = value, fill = Cond)) +
+  geom_violin(show.legend = F) +
+  stat_summary(fun=mean, geom="line", size=0.75, show.legend = F, aes(group = 1)) +
+  stat_summary(fun=mean, geom="point", size=1.25, show.legend = F) +
+  scale_fill_manual(values = pMHC_colors) +
+  facet_wrap(~Feature, scales = "free", ncol = 1) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+
+ggplot(pulses_nfat, aes(x = Cond, y = value, fill = Cond)) +
+  geom_violin(show.legend = F) +
+  stat_summary(fun=mean, geom="line", size=0.75, show.legend = F, aes(group = 1)) +
+  stat_summary(fun=mean, geom="point", size=1.25, show.legend = F) +
+  scale_fill_manual(values = pMHC_colors) +
+  facet_wrap(~Feature, scales = "free", ncol = 1) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+ggplot(pulses_long, aes(x = Cond, y = value, fill = Cond)) +
+  geom_violin(show.legend = F) +
+  stat_summary(fun=mean, geom="line", size=0.75, show.legend = F, aes(group = 1)) +
+  stat_summary(fun=mean, geom="point", size=1.25, show.legend = F) +
+  scale_fill_manual(values = pMHC_colors) +
+  facet_wrap(~Feature, scales = "free", ncol = 2) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank())
+  
+
+```
+
+2D feature plots - Fig 2E
+```{r}
+
+features <- rf_data
+features[,c("Erk_late", "NFAT_late", "Erk_early", "NFAT_early")] <- scale(features[,c("Erk_late", "NFAT_late", "Erk_early", "NFAT_early")])
+
+#Create df with means and plot the means in the center of the ellipses
+IA_split <- split(features, features$Cond)
+IA_means <- as.data.frame(bind_rows(lapply(IA_split, function(x) { colMeans(x[,c("Erk_late", "NFAT_late", "Erk_early", "NFAT_early")]) })))
+IA_means$Cond <- factor(names(IA_split), levels = names(IA_split))
+
+
+ggplot(features, aes(x = NFAT_late, y = Erk_late, color = Cond)) +
+  geom_point(size = 0.5, alpha = 0, show.legend = F) +
+  stat_ellipse(type = "norm", show.legend = F, level = 0.67) +
+  geom_point(data = IA_means, show.legend = F, shape = 23, aes(fill = Cond), color = "black") +
+  scale_color_manual(values = pMHC_colors) +
+  scale_fill_manual(values = pMHC_colors) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  
+  ggplot(features, aes(x = NFAT_early, y = Erk_early, color = Cond)) +
+  geom_point(size = 0.5, alpha = 0, show.legend = F) +
+  stat_ellipse(type = "norm", show.legend = F, level = 0.67) +
+  geom_point(data = IA_means, show.legend = F, shape = 23, aes(fill = Cond), color = "black") +
+  scale_color_manual(values = pMHC_colors) +
+  scale_fill_manual(values = pMHC_colors) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+p1 <- ggplot(features, aes(x = NFAT_late, y = Erk_late, color = Cond)) +
+  geom_point(size = 0.3, alpha = 0.5, show.legend = F) +
+  #stat_ellipse(type = "norm", show.legend = F, level = 0.67) +
+  geom_point(data = IA_means, show.legend = F, shape = 18, size = 2, aes(fill = Cond), color = "black") +
+  scale_color_manual(values = pMHC_colors) +
+  scale_fill_manual(values = pMHC_colors) +
+  facet_wrap(~Cond, nrow = 1) +
+  geom_hline(aes(yintercept = 0)) +
+  geom_vline(aes(xintercept = 0)) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), strip.background = element_blank(),
+  strip.text.x = element_blank()) 
+  
+p2 <- ggplot(features, aes(x = NFAT_early, y = Erk_early, color = Cond)) +
+  geom_point(size = 0.3, alpha = 0.5, show.legend = F) +
+  #stat_ellipse(type = "norm", show.legend = F, level = 0.67) +
+  geom_point(data = IA_means, show.legend = F, shape = 18, size = 2, aes(fill = Cond), color = "black") +
+  scale_color_manual(values = pMHC_colors) +
+  scale_fill_manual(values = pMHC_colors) +
+  facet_wrap(~Cond, nrow = 1) +
+  geom_hline(aes(yintercept = 0)) +
+  geom_vline(aes(xintercept = 0)) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), strip.background = element_blank(),
+  strip.text.x = element_blank())
+
+p1 + p2 +
+  plot_layout(nrow = 2)
+
+
+
+```
+

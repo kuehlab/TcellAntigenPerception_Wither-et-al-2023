@@ -1,0 +1,428 @@
+---
+title: "Random Forest models"
+author: "Matthew Wither"
+date: "5/9/23"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+  
+Load packages and user-defined functions
+```{r Load packages, eval=FALSE}
+library(DescTools)
+library(tidyr)
+library(ggplot2)
+library(dplyr)
+library(ggpubr)
+library(RColorBrewer)
+suppressPackageStartupMessages(library(ComplexHeatmap))
+library(viridis)
+library(circlize)
+library(randomForest)
+library(caret)
+library(pbapply)
+library(patchwork)
+
+compute_percentage <- function(x) {x/sum(x) * 100}
+
+make_kfold_splits <- function(df, kfolds = 5, ntimes = 5) {
+  
+  #Folds are the number of equal-sized partitions of the dataframe after stratification,
+  #preserving relative frequencies of each condition per fold.
+  
+  #Times is how many times to independently repeat the k-fold splitting
+  
+  splits <- caret::createMultiFolds(df$Cond, k = kfolds, times = ntimes)
+  splits
+  
+}
+
+do_RF <- function(ksplit, df, class_name = "Cond", predictor_vars, mtry = NA, tune_mtry = FALSE, downsample = T) {
+  
+  #Split data
+  training_data <- df[ksplit,]
+  test_data <- df[-ksplit,]
+  
+  #Train model
+  if (is.na(mtry)) {
+    
+    if(tune_mtry) {
+      #Optimize mtry on error rate
+      rf <- tuneRF(training_data[,predictor_vars], training_data[,class_name],
+                   stepFactor = 0.6,
+                   plot = FALSE,
+                   ntreeTry = 150,
+                   trace = TRUE,
+                   improve = 0.05,
+                   doBest = TRUE)
+    } else {
+      
+      #Write formula
+      rf_formula <- as.formula(paste(paste0(class_name, " ~"), paste(predictor_vars, collapse = " + ")))
+      #Use default mtry value
+      rf <- randomForest(rf_formula, data = training_data, proximity = TRUE, na.action = na.roughfix)
+    
+    }
+    
+    
+  } else {
+    
+    #Use specified mtry value
+    rf_formula <- as.formula(paste(paste0(class_name, " ~"), paste(predictor_vars, collapse = " + ")))
+    rf <- randomForest(rf_formula, data = training_data, mtry = mtry, proximity = TRUE, na.action = na.roughfix)
+    
+    }
+  
+  #Validate model
+  #Downsample validation data for balanced test data
+  if (downsample) {
+    test_data <- caret::downSample(test_data[, colnames(test_data)[!(colnames(test_data) == "Cond")] ], test_data$Cond, yname = "Cond")
+  }
+  
+  p1 <- predict(rf, test_data)
+  p1_output <- confusionMatrix(p1, test_data[,class_name], mode = "everything")
+  p1_output
+  
+}
+
+get_confusion_matrix <- function(result, apply_dim) {
+  conf_mat <- result$table
+  CM <- matrix(conf_mat, ncol = ncol(conf_mat), dimnames = dimnames(conf_mat))
+  
+  if (apply_dim == 1) {
+    CM <- matrix(apply(CM, apply_dim, compute_percentage), ncol = ncol(conf_mat), nrow = ncol(conf_mat), dimnames = dimnames(CM), byrow = T)
+  } else if (apply_dim == 2) {
+    CM <- matrix(apply(CM, apply_dim, compute_percentage), ncol = ncol(conf_mat), nrow = ncol(conf_mat), dimnames = dimnames(CM), byrow = F)
+  }
+  
+  CM
+}
+
+get_model_performance <- function(result) {
+  as.matrix(result$byClass)
+}
+
+get_model_stats <- function(result) {
+  result$overall
+}
+
+summarize_kfold_model <- function(model_results, apply_dim) {
+  
+  summary <- list()
+  
+  l <- length(model_results)
+  
+  #Average all confusion matrices
+  CM_list <- lapply(model_results, FUN = get_confusion_matrix, apply_dim = apply_dim)
+  CM_mean <- Reduce("+", CM_list)/l
+  summary[["CM"]] <- CM_mean
+  
+  #mean +/- SD for performance metrics
+  metrics_list <- lapply(model_results, FUN = get_model_performance)
+
+  metrics_mean <- as.data.frame(Reduce("+", metrics_list)/l)
+  metrics_sd <- apply(array(unlist(metrics_list), c(dim(metrics_mean), l)), c(1,2), sd)
+
+  metrics_mean$Cond <- factor(gsub("Class: ", '', rownames(metrics_mean)), levels = rownames(CM_mean))
+  metrics_mean <- pivot_longer(metrics_mean, cols = -(length(colnames(metrics_mean))), names_to = "metric", values_to = "score")
+
+  metrics_sd <- as.data.frame(metrics_sd)
+  colnames(metrics_sd) <- metrics_mean$metric[1:11]
+  metrics_sd$Cond <- levels(metrics_mean$Cond)
+  metrics_sd <- pivot_longer(metrics_sd, cols = 1:11, names_to = "metric", values_to = "SD")
+
+  summary[["metrics"]] <- as.data.frame(metrics_mean)
+  summary[["metrics_sd"]] <- as.data.frame(metrics_sd)
+
+  #overall statistics
+  overall_stats <- lapply(model_results, FUN = get_model_stats)
+  overall_mean <- Reduce("+", overall_stats)/l
+  summary[["overall"]] <- overall_mean
+  
+  summary
+  
+}
+
+#Uses red,white,blue color map
+make_CM_heatmap <- function(mod, breaks = c(0,40,80)) {
+  labels_rows <- rowAnnotation(Cond = factor(rownames(mod$CM), levels = rownames(mod$CM)),
+                               col = list(Cond = pMHC_colors),
+                               simple_anno_size = unit(2, "mm"),
+                               show_annotation_name = FALSE, show_legend = F)
+  
+  labels_columns <- HeatmapAnnotation(Cond = factor(rownames(mod$CM), levels = rownames(mod$CM)),
+                                      col = list(Cond = pMHC_colors),
+                                      simple_anno_size = unit(2, "mm"),
+                                      show_annotation_name = FALSE, show_legend = F)
+  
+  CM_palette <- colorRamp2(breaks, c("blue", "white", "red"))
+  
+  hm <- Heatmap(mod$CM, cluster_rows = F, cluster_columns = F,
+                col <- CM_palette,
+                cell_fun = function(j, i, x, y, width, height, fill) {
+                  grid.text(paste0(round(mod$CM[i, j],1), "%"), x, y, gp = gpar(fontsize = 10, fontface = "bold"))},
+                name = "Pred. %",
+                row_title = "Predicted",
+                right_annotation = labels_rows,
+                bottom_annotation = labels_columns,
+                show_row_names = F, show_column_names = F,
+                column_title = "True")
+
+  return(hm)
+  
+}
+
+get_stat_byClass <- function(m, name, stat = "F1") {
+  out.df <- subset(m$metrics, metric == stat)
+  sd <- subset(m$metrics_sd, metric == stat)
+  out.df$SD <- sd$SD
+  out.df$model <- as.character(name)
+  as.data.frame(out.df)
+}
+
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+
+```
+
+----------------------------------------------------------------
+
+Load saved rf data
+```{r}
+
+main_dir <- "/Users/matthewjwither/Desktop/analysis_objects/"
+
+#data frame containing observations (i.e cells) as rows and predictor variables as columns. 
+#There needs to be a column with the Class IDs as a factor (i.e condition)
+rf_data <- readRDS(paste0(main_dir, "rf_data.rds"))
+
+#Provide a named vector of colors to be used for bar plots
+pMHC_colors <-c("02pmolA" = "plum1", "2pmolA" = "mediumorchid2", "20pmolA" = "darkorchid3", "20pmolPA" = "#E38E14", "80pmolPA" = "#A17339")
+
+theme_set(theme_bw())
+
+```
+
+----------------------------------------------------------------
+
+Machine learning - Random Forest
+
+1. K-fold cross validation
+```{r}
+
+cond_subset <- c("20pmolA", "02pmolA", "20pmolPA")
+
+data <- subset(rf_data, Cond %in% cond_subset)
+data$Cond <- factor(data$Cond, levels = cond_subset)
+
+splits <- make_kfold_splits(df = data, ntimes = 5)
+
+#All 5 conditions - supplementary
+#data <- rf_data
+#splits <- make_kfold_splits(df = data, ntimes = 5)
+
+```
+
+2. Train and validate model - Figures: 2G, S2G,I,H
+```{r}
+
+models <- list()
+
+#Full time series
+models[["Full"]] <- pblapply(splits, FUN = do_RF, df = data, predictor_vars = colnames(data)[1:28], mtry = 7, downsample = T)
+
+#Use early vs late timepoints
+models[["TS_early"]] <- pblapply(splits, FUN = do_RF, df = data, predictor_vars = colnames(data)[c(1:3,15:17)], downsample = T)
+models[["TS_late"]] <- pblapply(splits, FUN = do_RF, df = data, predictor_vars = colnames(data)[c(7:14,21:28)], downsample = T)
+
+#Use features
+models[["Pulse features"]] <- pblapply(splits, FUN = do_RF, df = data, predictor_vars = c("Erkpeak_t", "NFATpeak_t", "Erkpeak_amp", "NFATpeak_amp", "num_Erkpeaks", "num_NFATpeaks"), downsample = T)
+models[["IA_late"]] <- pblapply(splits, FUN = do_RF, df = data, predictor_vars = c("Erk_late", "NFAT_late"), downsample = T)
+models[["IA_early"]] <- pblapply(splits, FUN = do_RF, df = data, predictor_vars = c("Erk_early", "NFAT_early"), downsample = T)
+
+#Only use single pathway
+models[["Erk"]] <- pblapply(splits, FUN = do_RF, df = data, predictor_vars = colnames(data)[1:14], downsample = T)
+models[["NFAT"]] <- pblapply(splits, FUN = do_RF, df = data, predictor_vars = colnames(data)[15:28], downsample = T)
+
+
+
+```
+
+2.1 Train model with incremental timepoints added - Fig 2H
+```{r}
+
+#Add timepoints stepwise and plot the accuracy change with increasing timepoints
+
+#Forward (Early)
+models_TS <- lapply(c(1:14), FUN = function(x) { 
+  print(as.character(x))
+  predictors <- colnames(data)[c(1:x,15:(x+14))]
+  result <- pblapply(splits, FUN = do_RF, df = data, predictor_vars = predictors, downsample = T)
+  return(result)
+  })
+names(models_TS) <- as.character(c(1:14))
+
+#Reverse (Late)
+models_TS_rev <- lapply(c(1:14), FUN = function(x) { 
+  print(as.character(x))
+  x2 <- x-1
+  predictors <- colnames(data)[ c((14-x2):14,(28-x2):28) ]
+  result <- pblapply(splits, FUN = do_RF, df = data, predictor_vars = predictors, downsample = T)
+  return(result)
+  })
+names(models_TS_rev) <- as.character(c(1:14))
+
+#3 hr windows
+models_windows_3hr <- mapply(FUN = function(x, pathway) { 
+  print(as.character(x))
+  print(pathway)
+  if (pathway == "NFAT") {
+    start <- x+14
+    end <- start+2
+    predictors <- colnames(data)[start:end]
+    
+  } else if (pathway == "Dual") {
+    start <- x+14
+    end <- start+2
+    predictors <- colnames(data)[c(x:(x+2),start:end)]
+      
+  } else {
+    predictors <- colnames(data)[x:(x+2)]
+  }
+  
+  result <- pblapply(splits, FUN = do_RF, df = data, predictor_vars = predictors, downsample = T)
+  return(result)
+  
+  }, x = rep(c(1:12), 3), pathway = rep(c("Erk", "NFAT", "Dual"), each = 12), SIMPLIFY = F)
+names(models_windows_3hr) <- paste(as.character(rep(c(3:14), 3)), rep(c("Erk", "NFAT", "Dual"), each = 12), sep = "_")
+
+
+```
+
+3. Summarize model performance
+```{r}
+
+#compute percentage over:
+#rows(precision) - apply_dim = 1
+#columns(sensitivity) - apply_dim = 2
+
+metrics <- lapply(models, summarize_kfold_model, apply_dim = 1)
+metrics1 <- lapply(models_TS, summarize_kfold_model, apply_dim = 1)
+metrics2 <- lapply(models_TS_rev, summarize_kfold_model, apply_dim = 1)
+metrics3 <- lapply(models_windows_3hr, summarize_kfold_model, apply_dim = 1)
+
+
+```
+
+4. Plot confusion matrix
+```{r}
+#Single heatmap per model - red/white/blue color map
+hm_list <- lapply(metrics, make_CM_heatmap)
+
+setwd("/Users/matthewjwither/Desktop")
+pdf(file = "model_CMs_main.pdf", width = 6.5, height = 3)
+draw(hm_list[["Full"]] + hm_list[["TS_late"]])
+dev.off()
+
+setwd("/Users/matthewjwither/Desktop")
+pdf(file = "model_CMs_supp_5conds.pdf", width = 11, height = 3)
+draw(hm_list[["Full"]] + hm_list[["IA_late"]] + hm_list[["IA_early"]] + hm_list[["Pulse features"]])
+dev.off()
+
+
+#Subtract single pathway precision from dual pathway precision to see the effect of removing each pathway
+metrics[["Erk_diff"]] <- metrics[["Erk"]]
+metrics[["Erk_diff"]]$CM <- metrics[["NFAT"]]$CM - metrics[["Full"]]$CM
+  
+metrics[["NFAT_diff"]] <- metrics[["NFAT"]]
+metrics[["NFAT_diff"]]$CM <- metrics[["Erk"]]$CM - metrics[["Full"]]$CM
+
+hm_list2 <- lapply(metrics, make_CM_heatmap, breaks = c(-20,0,20))
+draw(hm_list2[["Erk_diff"]] + hm_list2[["NFAT_diff"]])
+
+setwd("/Users/matthewjwither/Desktop")
+pdf(file = "model_CMs_supp_diff.pdf", width = 6.5, height = 3)
+draw(hm_list2[["Erk_diff"]] + hm_list2[["NFAT_diff"]])
+dev.off()
+     
+
+```
+
+5. Plot model accuracy - Fig S2
+```{r}
+
+#Supplementary models
+Accuracy <- bind_rows(lapply(metrics, function(x) {x$overall[c(1,3,4,6)]}))
+Accuracy$model <- factor(names(metrics), levels = names(metrics))
+Accuracy$p <- log10(Accuracy$AccuracyPValue)
+
+ggplot(Accuracy, aes(x = model, y = Accuracy, fill = model)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.75, color = "black", size = 0.5, show.legend = F) +
+  geom_errorbar(aes(ymin=Accuracy-(Accuracy-AccuracyLower), ymax=Accuracy+(AccuracyUpper-Accuracy)), width=.1, position=position_dodge(.9)) +
+  geom_hline(aes(yintercept = 0.2), linetype = "dotted") +
+  scale_fill_grey(start = 0.2, end = 0.8) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  
+  ggplot(Accuracy, aes(x = model, y = p, fill = p)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.75, color = "black", size = 0.5, show.legend = F) +
+  scale_fill_gradient(low = "red", high = "white") +
+  geom_hline(aes(yintercept = log10(0.05)), linetype = "dotted") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+
+
+
+
+```
+
+6. Plot model accuracy by time window/duration - Fig 2H
+```{r}
+
+Accuracy2 <- bind_rows(lapply(metrics2, function(x) {x$overall[c(1,3,4,6)]}))
+Accuracy2$model <- factor(1:14, levels = 1:14)
+Accuracy2$start <- "Reverse"
+
+Accuracy1 <- bind_rows(lapply(metrics1, function(x) {x$overall[c(1,3,4,6)]}))
+Accuracy1$model <- factor(1:14, levels = 1:14)
+Accuracy1$start <- "Forward"
+
+Accuracy_both <- bind_rows(Accuracy2, Accuracy1)
+
+Accuracy3 <- bind_rows(lapply(metrics3, function(x) {x$overall[c(1,3,4,6)]}))
+Accuracy3$model <- factor(names(models_windows_3hr), levels = names(models_windows_3hr))
+Accuracy3$pathway <- factor(rep(c("Erk", "NFAT", "Dual"), each = 12), levels = c("Erk", "NFAT", "Dual"))
+Accuracy3$window <- rep(c(3:14), 3)
+dual_windows <- subset(Accuracy3, pathway == "Dual")
+
+
+ggplot(Accuracy_both, aes(x = model, y = Accuracy, group = start, color = start)) +
+  geom_point() + geom_line() +
+  #geom_errorbar(aes(ymin=Accuracy-(Accuracy-AccuracyLower), ymax=Accuracy+(AccuracyUpper-Accuracy)), width=.1, position=position_dodge(0)) +
+  geom_hline(aes(yintercept = 1/3), linetype = "dotted") +
+  geom_hline(aes(yintercept = 0.69), linetype = "solid", color = "red") +
+  labs(x = "duration") +
+  scale_color_grey(start = 0.5, end = 0.1) +
+  scale_y_continuous(breaks = c(0, round(1/3, 2), 0.4, 0.5, 0.6, 0.7)) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  
+  ggplot(dual_windows, aes(x = window, y = Accuracy)) +
+  geom_point() + geom_line(aes(group = 1)) +
+  #geom_errorbar(aes(ymin=Accuracy-(Accuracy-AccuracyLower), ymax=Accuracy+(AccuracyUpper-Accuracy)), width=.1, position=position_dodge(.9)) +
+  geom_hline(aes(yintercept = 1/3), linetype = "dotted") +
+  geom_hline(aes(yintercept = 0.69), linetype = "solid", color = "red") +
+  labs(x = "3hr window center") +
+  #ylim(0,1) +
+  scale_x_continuous(breaks = 3:14) +
+  scale_y_continuous(breaks = c(0, round(1/3, 2), 0.4, 0.5, 0.6, 0.7)) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+
+
+```
+

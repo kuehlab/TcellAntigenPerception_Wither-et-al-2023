@@ -1,0 +1,605 @@
+---
+title: "T Cell Signaling Analysis"
+author: "Matthew Wither"
+date: "1/31/22"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+
+Load packages
+```{r Load packages, eval=FALSE}
+library(DescTools)
+library(tidyr)
+library(ggplot2)
+library(ggridges)
+library(dplyr)
+library(ggpubr)
+library(RColorBrewer)
+suppressPackageStartupMessages(library(ComplexHeatmap))
+library(gplots)
+library(cluster)
+library(zoo)
+library(dendextend)
+library(viridis)
+library(plotly)
+library(circlize)
+library(ggforce)
+library(reshape2)
+library(pbmcapply)
+library(randomForest)
+library(caret)
+library(patchwork)
+library(pbmcapply)
+library(ClassDiscovery)
+library(dtwclust)
+
+```
+
+Functions
+```{r User-defined functions, eval=FALSE}
+
+DataCleanUp <- function(df, condition, celldrop = FALSE, tps_total = NA, tps_consec = NA, H2B_thresh = 0.7, Arm = 2, convert_time = 0, t_max) {
+  if ("Track" %in% colnames(df)) {
+    df$Track <- as.factor(df$Track)
+  }
+  
+  #Add exclusion column
+  df$Exclusion <- 1
+  
+  if (Arm == 1) { 
+    df <- subset(df, select = -c(Death, Division, Stain)) #Remove tags if this is early signaling data where these are not used
+    df <- df[complete.cases(df),] #Remove rows with NaN - This was an error in the low in/high in workaround. Should be fixed after 9/30/21
+  }
+  
+  if (convert_time != 0) {
+    #Convert real time to timepoint no. (i.e measurement number) Convert back to real time before returning out.df
+    df$Time <- df$Time/convert_time
+  }
+  
+  databytrack <- split(df, df$Track)
+  for (i in 1:length(databytrack)) {
+    temp <- databytrack[[i]]
+    
+    if (celldrop) {
+      start <- temp$Time[1]
+      temp$Time <- temp$Time - start
+    }
+    
+    #Set to limit time series
+    temp <- subset(temp, Time <= t_max)
+    
+    #Exclude based on H2B signal.
+    temp <- subset(temp, H2B >= H2B_thresh)
+    
+    #Exclude if there is too much nucleus outside of cytoplasm - i.e out of focus cell
+    temp <- subset(temp, Nuc_only_Area <= 0.1)
+    
+    #No further testing if all timepoints fail
+    if (length(temp$Time) > 0) {
+      #Exclude if no IRF4 measurement
+      # if (is.nan(temp$Stain1_nuc[length(temp$Stain1_nuc)])) {
+      #   temp$Exclusion <- 0
+      # }
+      
+      #Exclude based on total no. of timepoints
+      if (!is.na(tps_total)) {
+        if (length(temp$Time) < tps_total) {
+          temp$Exclusion <- 0
+        }
+      }
+      
+      #Exclude based on too many missing consecutive timepoints
+      #Re-write to go backwards for IRF4 data.
+      if (!is.na(tps_consec) && temp$Exclusion[1] != 0) {
+        t.dist = c(1)
+        for (t in 1:(length(temp$Time)-1)) {
+          t.dist[t] <- temp$Time[t+1] - temp$Time[t]
+        }
+        if (max(t.dist, na.rm = T) > tps_consec) {
+          temp$Exclusion <- 0
+        }
+      }
+      
+    }
+    
+    
+    #Add track back in.
+    databytrack[[i]] <- temp
+  }
+  
+  out.df <- bind_rows(databytrack)
+  
+  if (convert_time != 0) {
+    #Convert time back to real time
+    out.df$Time <- (out.df$Time)* convert_time
+  }
+  
+  out.df$Cond <- condition
+  out.df$Erk_corr <- out.df$Erk_corr*-1
+  
+  out.df$ID <- paste(out.df$Cond, out.df$Track, sep = " ")
+  out.df <- subset(out.df, Exclusion == 1)
+  out.df$Track <- factor(out.df$Track)
+  
+  out.df
+}
+
+CalcVelocity <- function(df) {
+  databytrack <- split(df, df$Track)
+
+  for (i in 1:length(databytrack)) {
+    temp <- databytrack[[i]]
+    
+    t <- temp$Time
+    x <- temp$x
+    y <- temp$y
+    
+    velocities <- t
+    
+    for (j in 1:(length(velocities)-1)) {
+      dx <- x[j+1] - x[j]
+      dy <- y[j+1] - y[j]
+      dt <- t[j+1] - t[j]
+      #Pythagorean theorem
+      c <- sqrt((dx*dx) + (dy*dy))
+      velocities[j] <- c/dt
+    }
+    velocities[length(velocities)] <- NA
+    temp$Velocity <- velocities
+    
+    databytrack[[i]] <- temp
+  }
+  out.df <- bind_rows(databytrack)
+  out.df
+}
+
+CurveFit <- function(df, span_start = 0.25, no_tps, t_interval = 1, t_start = 1, corr_coeff = FALSE, convert_time) {
+  databytrack <- split(df, df$Track)
+  for (i in 1:length(databytrack)) {
+    temp <- databytrack[[i]]
+    
+    if (convert_time != 0) {
+      #Convert real time to timepoint no. (i.e measurement number) Convert back to real time before smoothing
+      temp$Time <- temp$Time/convert_time + 1
+    }
+
+    df1 <- data.frame("Time" = seq(t_start, no_tps, t_interval), "NFAT" = NA, "Erk" = NA)
+    
+    if (!corr_coeff) {
+      for (j in 1:length(temp$NFAT)) {
+        df1$NFAT[temp$Time[j]] <- temp$NFAT[j]
+        df1$Erk[temp$Time[j]] <- temp$Erk[j]
+      }
+    } else {
+      for (j in 1:length(temp$NFAT)) {
+        df1$NFAT[temp$Time[j]] <- temp$NFAT_corr[j]
+        df1$Erk[temp$Time[j]] <- temp$Erk_corr[j]
+      }
+    }
+    
+    #Fit curve for NFAT
+    result <- 0
+    a <- span_start
+    while (result == 0) {
+      loess.NFAT <- try(loess(NFAT ~ Time, data=df1, span = a, na.action = na.exclude, silent=T))
+      if(loess.NFAT$s != "NaN"){
+        result <- 1
+        a <- span_start
+        smooth.NFAT <- predict(loess.NFAT, newdata = df1$Time, se = F)
+      } else {
+        a <- a + 0.05
+      }
+    }
+    
+    #Fit curve for Erk
+    result <- 0
+    a <- span_start
+    while (result == 0) {
+      loess.Erk <- try(loess(Erk ~ Time, data=df1, span = a, na.action = na.exclude, silent=T))
+      if(loess.Erk$s != "NaN"){
+        result <- 1
+        a <- span_start
+        smooth.Erk <- predict(loess.Erk, newdata = df1$Time, se = F)
+      } else {
+        a <- a + 0.05
+      }
+    }
+    
+    temp.sm <- data.frame("Track" = rep.int(temp$Track[1], no_tps), "Cond" = rep.int(temp$Cond[1], no_tps),
+                          "Time" = seq(t_start, no_tps, t_interval), "NFAT" = smooth.NFAT, "Erk" = smooth.Erk)
+    
+    if (convert_time != 0) {
+      #Convert time back to real time
+      temp.sm$Time <- (temp.sm$Time-1)*convert_time
+    }
+    #Add track back in.
+    databytrack[[i]] <- temp.sm
+  }
+  df <- bind_rows(databytrack)
+  df
+}
+
+SmoothedDataFilter <- function(df, frac_acceptable_missing_data = 0.15, tmax = trange) {
+  databytrack <- split(df, df$Track)
+  exclusion_list <- c()
+  for (i in 1:length(databytrack)) {
+    temp <- databytrack[[i]]
+    temp <- subset(temp, Time <= tmax)
+    if (length(which(is.na(temp$NFAT))) / (length(temp$Time)) >= frac_acceptable_missing_data) {
+      exclusion_list[length(exclusion_list)+1] <- i
+    }
+    databytrack[[i]] <- temp
+  }
+  
+  if (length(exclusion_list >= 1)) {
+    tracks_out <- databytrack[-exclusion_list]
+  } else {
+    tracks_out <- databytrack
+  }
+  
+  tracks_out <- bind_rows(tracks_out)
+  tracks_out$Track <- factor(tracks_out$Track)
+  tracks_out
+  
+}
+
+CalcDerivative <- function(df, dt = 1) {
+  databytrack <- split(df, df$Track)
+  pathways <- c("Erk", "NFAT")
+  for (i in 1:length(databytrack)) {
+    temp <- databytrack[[i]]
+    
+    for (pathway in 1:length(pathways)) {
+      values <- temp[,pathways[pathway]]
+      derivs <- rep(NA, length(temp$Time))
+      for (t in 1:(length(values)-1)) {
+        derivs[t] <- (values[t+1] - values[t])/dt
+      }
+      temp[,paste0("d",pathways[pathway], "dt")] <- c(NA, derivs[-length(derivs)])
+    }
+    
+    databytrack[[i]] <- temp
+  }
+  out.df <- bind_rows(databytrack)
+  out.df
+}
+
+CalcMeanSD <- function(df, AreaMean = FALSE, VelocityMean = FALSE) {
+  
+  if (nrow(df) > 0) {
+    #Get condition
+    condition <- df$Cond[1]
+    #Split data by timepoint
+    tps <- split(df, df$Time)
+    #Extract pathway data by timepoint
+    Erk <- lapply(tps, "[[", "Erk")
+    NFAT <- lapply(tps, "[[", "NFAT")
+    
+    #Calculate means
+    Erk_means <- sapply(Erk, mean, na.rm = TRUE)
+    NFAT_means <- sapply(NFAT, mean, na.rm = TRUE)
+    
+    #Calculate standard deviations
+    Erk_sd <- sapply(Erk, sd, na.rm = TRUE)
+    NFAT_sd <- sapply(NFAT, sd, na.rm = TRUE)
+    
+    Erk_se <- sapply(Erk, standard_error)
+    NFAT_se <- sapply(NFAT, standard_error)
+    
+    #Export as data frames with same column names as data for ease of plotting
+    out.df <- data.frame("Time" = as.numeric(names(tps)), "Erk" = Erk_means, "NFAT" = NFAT_means,
+                         "ErkSD" = Erk_sd, "NFATSD" = NFAT_sd,
+                         "ErkSE" = Erk_se, "NFATSE" = NFAT_se,
+                         "Cond" = condition)
+    
+    if (AreaMean) {
+      Area <- lapply(tps, "[[", "Area")
+      Area_means <- sapply(Area, mean, na.rm = TRUE)
+      Area_sd <- sapply(Area, sd, na.rm = TRUE)
+      
+      out.df$Area <- Area_means
+      out.df$AreaSD <- Area_sd
+    }
+    
+    if (VelocityMean) {
+      Velocity <- lapply(tps, "[[", "Velocity")
+      Velocity_means <- sapply(Velocity, mean, na.rm = TRUE)
+      Velocity_sd <- sapply(Velocity, sd, na.rm = TRUE)
+      
+      out.df$Velocity <- Velocity_means
+      out.df$VelocitySD <- Velocity_sd
+    }
+    
+  } else {
+     out.df <- df
+  }
+ 
+  out.df
+}
+
+standard_error <- function(x) sd(x, na.rm = TRUE) / sqrt(length(x))
+
+DataFilter <- function(df, keepDead = FALSE) {
+  df$ID <- paste(df$Cond, df$Track, sep = " ")
+  df <- subset(df, Exclusion == 1)
+  if (!keepDead & "Death" %in% colnames(df)) {
+    df <- subset(df, is.nan(Death))
+  }
+  df$Track <- factor(df$Track)
+  df
+}
+
+```
+
+
+
+Set parameters for 1 hr signaling analysis - 09/30/2021 dataset
+```{r Parameters}
+dir <- "/Users/matthewjwither/Desktop/Quantified_cell_objects"
+setwd(dir)
+
+infiles <- c("20210930_Arm1_0.2pmol", "20210930_Arm1_2pmol", "20210930_Arm1_20pmol")
+basename <- "20210930_Arm1_"
+
+include.baseline <- T    #Perform baseline subtraction?
+celldrop <- T           #Do celldrop correction?
+Experimental_Arm <- 1
+trange = 29 #20210930 dataset has 29 total
+
+#Determined from inhibitor data
+Erk_base <- 0.3443
+NFAT_base <- 0.2314
+
+tps_total <- 12 #no. of timepoints a track must have to be included. Set to NA to keep all tracks
+tps_consec <- 6 #maximum consecutive missing timepoints allowed. Set to NA to keep all tracks
+convert_time <- 4
+smoothing_window <- 0.65
+endpoint_stain <- FALSE
+
+legend.colors = c("Erk" = "blue", "NFAT" = "red")
+
+theme_set(theme_bw())
+
+```
+
+Load Data
+```{r Load Data}
+filenames <- paste(infiles, "csv", sep=".")
+
+if (!is.na(basename)) {
+  conditions <- gsub(basename, '', infiles)
+} else {
+  conditions <- infiles
+}
+
+#Process and format raw data
+data <- lapply(filenames, read.csv, header=TRUE)
+data <- mapply(DataCleanUp, data, conditions, celldrop = celldrop, H2B_thresh = 0.7, convert_time = convert_time,
+               tps_total = tps_total, tps_consec = tps_consec, Arm = Experimental_Arm, t_max = trange, SIMPLIFY = FALSE)
+
+if ("x" %in% colnames(data[[1]])) {
+  data <- lapply(data, CalcVelocity)
+}
+
+
+#Raw Data
+rawdata <- bind_rows(data)
+rawdata$Cond <- factor(rawdata$Cond, levels = conditions)
+
+
+if (include.baseline) {
+  rawdata_bsub <- rawdata
+  
+  rawdata_bsub$NFAT <- rawdata_bsub$NFAT-NFAT_base
+  rawdata_bsub$Erk <- rawdata_bsub$Erk-Erk_base
+
+}
+
+```
+
+Load baseline measurements from inhibitor data
+```{r}
+
+base_mins <- readRDS("/Users/matthewjwither/Desktop/analysis_objects/baseline_measurements.rds")
+Erk_base_sd <- sd(base_mins$Erk, na.rm = T)
+NFAT_base_sd <- sd(base_mins$NFAT, na.rm = T)
+
+```
+
+Calculate Mean +/- SD
+```{r Mean Traces}
+
+#using Raw data
+meanSD <- lapply(data, CalcMeanSD)
+meanSDdata <- bind_rows(meanSD)
+
+if (include.baseline) {
+  meanSDdata_bsub <- meanSDdata
+  meanSDdata_bsub$NFAT <- meanSDdata_bsub$NFAT-NFAT_base
+  meanSDdata_bsub$Erk <- meanSDdata_bsub$Erk-Erk_base
+
+}
+
+meanSDdata_bsub$Cond <- factor(meanSDdata_bsub$Cond, levels = conditions)
+
+```
+
+Figure S1C - 9/30/21 Arm1 Dataset
+```{r, eval = FALSE}
+
+#single cell trace example
+sc <- "30.08"
+
+axis_trans <- 1.4
+
+setwd("/Users/matthewjwither/Desktop")
+
+pdf(file = "FigS1C_sc.pdf", width = 6, height = 3)
+ggplot(data = subset(rawdata_bsub, Track == sc & Time <= 60)) +
+  #plot raw points
+  geom_point(aes(x=Time, y = NFAT/axis_trans, group = Track, color = "NFAT"), size = 1.5, alpha = 0.9, show.legend = F) +
+  geom_point(aes(x=Time, y = Erk, group = Track, color = "Erk"), size = 1.5, alpha = 0.9, show.legend = F) +
+  
+  #Add smoothed lin
+  geom_smooth(aes(x=Time, y = NFAT/axis_trans, group = Track, color = "NFAT"), size = 1.25, alpha = 0.7, se = F, span = 0.4, show.legend = F) +
+  geom_smooth(aes(x=Time, y = Erk, group = Track, color = "Erk"), size = 1.25, alpha = 0.7, se = F, span = 0.4, show.legend = F) +
+  
+  geom_hline(aes(yintercept = 0), color = "black", linetype = "dashed") +
+  
+  labs(x = "Time (min)",
+       y = "Activity (a.u)",
+       color = "Pathway") +
+  scale_x_continuous(breaks = c(0,10,20, 30, 40, 50, 60)) +
+  scale_y_continuous(name = "Erk", sec.axis = sec_axis(trans = ~.*axis_trans, name = "NFAT", breaks = seq(0,0.5,0.1)), breaks = seq(0,0.5,0.1), limits = c(-0.02, 0.35)) +
+  scale_color_manual(values = legend.colors) +
+  theme(panel.grid.major = element_blank(), axis.title.y = element_text(size = 18, color = "blue"), axis.title.y.right = element_text(color = "red", size=18),
+        axis.text.y = element_text(size = 18, color = "blue"), axis.text.y.right = element_text(size = 18, color = "red"), 
+        axis.title = element_text(size = 18, face = "bold"), axis.text.x = element_text(size = 18),
+        panel.grid.minor = element_blank())
+dev.off()
+
+
+#Population mean
+
+#Add baseline to data frame to show baseline mean +/- sd
+figure1means <- subset(meanSDdata_bsub, Cond == "2pmol")
+figure1means$Cond <- "Neg"
+figure1means$Erk <- 0
+figure1means$NFAT <- 0
+figure1means$ErkSD <- Erk_base_sd
+figure1means$NFATSD <- NFAT_base_sd
+
+figure1means <- bind_rows(figure1means, subset(meanSDdata_bsub, Cond == "2pmol"))
+figure1means <- subset(figure1means, Time <= 60)
+figure1means$Cond <- factor(figure1means$Cond)
+
+pdf(file = "Fig1C_pop_mean_v2.pdf", width = 4.5, height = 3)
+ggplot(data = subset(figure1means, Cond == "2pmol"), aes(x=Time)) +
+  
+  geom_ribbon(aes(ymax = NFAT/axis_trans + NFATSD/axis_trans, ymin = NFAT/axis_trans - NFATSD/axis_trans),alpha = 0.65, fill = "pink", colour = NA) +
+  geom_smooth(aes(y = NFAT/axis_trans, color = "NFAT"), se=FALSE, span = .4, size = 0.5, show.legend = F) +
+  
+  geom_ribbon(aes(ymax = Erk + ErkSD, ymin = Erk - ErkSD),alpha = 0.4, fill = "lightblue", colour = NA) +
+  geom_smooth(aes(y = Erk, color = "Erk"), se=FALSE, span = .4, size = 0.5, show.legend = F) +
+  
+  #Baseline values
+  geom_ribbon(data = subset(figure1means, Cond == "Neg"), aes(x = Time, ymax = Erk + ErkSD, ymin = Erk - ErkSD), alpha = 0.4, fill = "grey", colour = "lightblue") +
+  geom_ribbon(data = subset(figure1means, Cond == "Neg"), aes(x = Time, ymax = NFAT + NFATSD, ymin = NFAT - NFATSD), alpha = 0.4, fill = "grey", colour = "pink") +
+  geom_line(data = subset(figure1means, Cond == "Neg"), aes(x = Time, y = Erk), color = "black", linetype = "solid", size = 0.5) +
+  
+  labs(x = "Time (min)",
+       y = "Activity (a.u)",
+       color = "Pathway") +
+  scale_color_manual(values = legend.colors) +
+  scale_y_continuous(name = "Erk", sec.axis = sec_axis(trans = ~.*axis_trans, name = "NFAT", breaks = seq(-0.1,0.5,0.1)), 
+                     breaks = c(-0.05, seq(0,0.5,0.1)), limits = c(-0.06, 0.46)) +
+  theme(panel.grid.major = element_blank(), axis.title.y = element_text(size = 18, color = "blue"), axis.title.y.right = element_text(color = "red", size=18),
+        axis.text.y = element_text(size = 18, color = "blue"), axis.text.y.right = element_text(size = 18, color = "red"), 
+        axis.title = element_text(size = 18, face = "bold"), axis.text.x = element_text(size = 18),
+        panel.grid.minor = element_blank())
+
+dev.off()
+
+
+
+```
+
+Figure S1D-E - 9/30/21 Arm1 Dataset
+```{r,eval = FALSE}
+
+#######################################################
+#Violin plots of peak amplitude as a function of dose
+#Fig S1D
+
+#Baseline subtracted maximum values - calculated max from 0-12 min
+peakdata <- lapply(data, function(df) {
+  t_range <- c(0,12)
+  df$Erk <- df$Erk - Erk_base
+  df$NFAT <- df$NFAT - NFAT_base
+  databytrack <- split(df, df$Track)
+  out.df <- data.frame("Track" = names(databytrack))
+  for (i in 1:length(databytrack)) {
+    temp <- databytrack[[i]]
+
+    #Partial features
+      temp2 <- subset(temp, Time >= t_range[1] & Time <= t_range[2])
+      
+      #Max
+      out.df[i,"Erk"] <- max(temp2$Erk, na.rm=TRUE)
+      out.df[i,"NFAT"] <- max(temp2$NFAT, na.rm=TRUE)
+      out.df[i,"Cond"] <- temp2$Cond[1]
+    
+  }
+  return(out.df)
+  
+  })
+
+peakdata <- bind_rows(peakdata)
+
+#Add the negative control data to the experimental data
+peakdata <- peakdata[,colnames(base_mins)]
+peakdata <- bind_rows(peakdata, base_mins)
+peakdata$Cond <- gsub("pmol", '', peakdata$Cond)
+peakdata$Cond <- factor(peakdata$Cond, levels = c("Neg", gsub("pmol", '', conditions)))
+
+reds <- c("#fc9272", "#ef3b2c", "#a50f15")
+blues <- c("#9ecae1", "#4292c6", "#08519c")
+
+#Plot NFAT
+ggplot(data = peakdata, aes(x = Cond, y = NFAT, stroke = 0)) +
+  geom_violin(trim = F, size = 0.75, show.legend = F) +
+  geom_jitter(aes(color = Cond), alpha = 0.75, size = 2, shape = 20,
+              position = position_jitter(0.05), show.legend = F) +
+  stat_summary(fun=median, geom="line",size=0.75, color="black", show.legend = FALSE, aes(group = 1)) +
+  xlab("pMHC Dose (pmol)") +
+  ylab("NFAT Peak Activity (a.u)") +
+  ylim(-0.15,0.6) +
+  scale_color_manual(values = c("grey", reds)) +
+  theme(panel.grid.major = element_blank(), axis.title.y = element_text(size = 18),
+        axis.text.y = element_text(size = 18), axis.title = element_text(size = 18, face = "bold"), axis.text.x = element_text(size = 18),
+        panel.grid.minor = element_blank())
+
+#Plot Erk
+ggplot(data = peakdata, aes(x = Cond, y = Erk, stroke = 0)) +
+  geom_violin(trim = F, size = 0.75, show.legend = F) +
+  geom_jitter(aes(color = Cond), alpha = 0.75, size = 2, shape = 20,
+              position = position_jitter(0.05), show.legend = F) +
+  stat_summary(fun=median, geom="line",size=0.75, color="black", show.legend = FALSE, aes(group = 1)) +
+  xlab("pMHC Dose (pmol)") +
+  ylab("Erk Peak Activity (a.u)") +
+  ylim(-0.15,0.6) +
+  scale_color_manual(values = c("grey", blues)) +
+  theme(panel.grid.major = element_blank(), axis.title.y = element_text(size = 18),
+        axis.text.y = element_text(size = 18), axis.title = element_text(size = 18, face = "bold"), axis.text.x = element_text(size = 18),
+        panel.grid.minor = element_blank())
+
+#######################################################
+#Density plot of NFAT activation rate as a function of dose
+#Fig S1E
+
+#Add in blank condition to create a space in the plot
+d <- subset(rawdata_bsub, Time <= 4)
+splitd <- split(d, d$Cond)
+d2 <- d[1,]
+d3 <- d[200,]
+d4 <- d[500,]
+d2$Time <- 9
+d2$NFAT <- NA
+d3$NFAT <- NA
+d4$NFAT <- NA
+d3$Time <- 9
+d4$Time <- 9
+d5 <- bind_rows(d,d2,d3,d4)
+
+ggplot(data = d5, aes(x = NFAT, y = interaction(Time, Cond), fill = interaction(Time, Cond))) +
+  geom_density_ridges(show.legend = T) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  scale_fill_manual(name = "Dose", values = rep(reds, each = 2)) +
+  xlab("NFAT Activity (a.u)") +
+  ylab("") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.text.y = element_blank(), axis.title = element_text(size = 18, face = "bold"), axis.text.x = element_text(size = 18))
+
+```
