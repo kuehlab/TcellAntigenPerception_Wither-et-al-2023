@@ -1,6 +1,6 @@
 # antigen_perception_tcells
 
-R code for reproducing all analyses used in Wither et al. PNAS 2023.
+R code for reproducing all analyses used in Wither et al. Antigen perception in T cells by long-term Erk and NFAT signaling dynamics. PNAS 2023.
 
 .zip files contain relevant data used for reproducing our results:
   1. "Quantified_cell_objects" is the output from MATLAB containing activity measurements for Erk and NFAT derived from translocation reporters.
